@@ -202,13 +202,17 @@ function mpHandleMsg(msg){
   switch(msg.type){
     case 'assigned':{
       _mpMyPid=msg.pid; _mpMySlot=msg.slot; _mpMyTeam=msg.team; _mpIsHost=msg.isHost;
-      for(const p of msg.players){ _mpPlayers.set(p.pid,p); mpMarkBot(p.team,p.slot,p.name,p.pid); }
+      // Marquer uniquement les AUTRES joueurs, pas soi-même
+      for(const p of msg.players){
+        _mpPlayers.set(p.pid,p);
+        if(p.pid!==msg.pid) mpMarkBot(p.team,p.slot,p.name,p.pid);
+      }
       mpBegin(msg.name);
       break;
     }
     case 'player_joined':{
       _mpPlayers.set(msg.pid,msg);
-      mpMarkBot(msg.team,msg.slot,msg.name,msg.pid);
+      if(msg.pid!==_mpMyPid) mpMarkBot(msg.team,msg.slot,msg.name,msg.pid);
       break;
     }
     case 'player_left':{
@@ -245,6 +249,7 @@ function mpBegin(playerName){
 
   if(_mpIsHost){
     ship.name=playerName;
+    _mpMyShip=null; // host joue via ship normal, pas via un bot
   } else {
     // Non-host : le ship traditionnel n'existe pas
     ship.dead=true; ship.hp=0; _playerLives=0;
