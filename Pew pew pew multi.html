@@ -98,11 +98,6 @@
 
   /* ── Multijoueur ── */
   #mp-panel { display:none; flex-direction:column; align-items:center; gap:10px; width:100%; }
-  #mp-panel input {
-    width:100%; padding:8px 12px; background:rgba(0,10,40,0.8);
-    border:1px solid rgba(80,160,255,0.3); border-radius:5px;
-    color:#8affcc; font:13px monospace; letter-spacing:0.08em; text-align:center; outline:none;
-  }
   .mp-teams { display:flex; gap:12px; }
   .mp-btn-blue {
     padding:10px 22px; background:linear-gradient(135deg,rgba(20,60,200,0.9),rgba(10,30,100,0.9));
@@ -142,7 +137,6 @@
     <div class="smenu-sep"></div>
     <button id="mp-toggle" onclick="mpTogglePanel()">🌐 &nbsp;Mode Multijoueur</button>
     <div id="mp-panel">
-      <input id="mp-server-url" value="wss://pew-pew-pew-online-production.up.railway.app" spellcheck="false" autocomplete="off">
       <div class="mp-teams">
         <button class="mp-btn-blue" onclick="mpJoin('blue')">▶ Équipe Bleue</button>
         <button class="mp-btn-red"  onclick="mpJoin('red')">▶ Équipe Rouge</button>
@@ -186,9 +180,8 @@ function mpTogglePanel(){
 function mpStatus(txt){ const el=document.getElementById('mp-status-txt'); if(el) el.textContent=txt; }
 
 function mpJoin(team){
-  const urlEl=document.getElementById('mp-server-url');
   const nameEl=document.getElementById('menu-name');
-  const url=(urlEl?urlEl.value.trim():'')||'wss://pewpewpew.up.railway.app';
+  const url='wss://pew-pew-pew-online-production.up.railway.app';
   const name=(nameEl?nameEl.value.trim():'JOUEUR')||'JOUEUR';
   mpStatus('Connexion à '+url+' …');
   try { _mpWs=new WebSocket(url); } catch(e){ mpStatus('URL invalide'); return; }
@@ -307,7 +300,7 @@ function mpApplyState(s){
 function mpSendInput(){
   if(_mpIsHost||!_mpWs||_mpWs.readyState!==1) return;
   _mpWs.send(JSON.stringify({type:'input',
-    keys:{up:!!keys.up,down:!!keys.down,left:!!keys.left,right:!!keys.right,fire:!!keys.fire}}));
+    keys:{left:!!keys.left,right:!!keys.right,fire:!!keys.fire}}));
 }
 
 // ── Contrôle bot par réseau (host side) ──────────────────────────────────
@@ -324,12 +317,11 @@ function mpNetRespawn(ai,team){
 }
 function updateNetPlayer(ai,nk){
   if(!nk) return;
-  if(nk.left)  ai.angle-=0.045;
-  if(nk.right) ai.angle+=0.045;
-  if(nk.up){ ai.vx+=Math.cos(ai.angle)*THRUST_FWD; ai.vy+=Math.sin(ai.angle)*THRUST_FWD; }
-  const spd=Math.hypot(ai.vx,ai.vy);
-  if(spd>MAX_SPEED){ ai.vx=ai.vx/spd*MAX_SPEED; ai.vy=ai.vy/spd*MAX_SPEED; }
-  ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN; ai.x+=ai.vx; ai.y+=ai.vy;
+  // Physique identique à applyPhysics(ai, nk.left, nk.right) :
+  // clic gauche seul → pivot gauche + micro-thrust
+  // clic droit seul  → pivot droit  + micro-thrust
+  // les deux clics   → thrust avant plein
+  applyPhysics(ai, !!nk.left, !!nk.right);
   if(nk.fire){
     if((ai._nfTimer||0)<=0){
       const _bspd=8;
@@ -3790,13 +3782,19 @@ function drawHUD(){
     ctx.fillText(isMobile?'◄ tap gauche   tap droit ►':'[V] quitter  ◄ [Q/A]  [E/D] ►',W/2,30);
     ctx.textAlign='left';
   }
-  if(ship.dead){
-    {
-      rr(ctx,W/2-160,H/2-32,320,52,7); ctx.fillStyle='rgba(4,8,28,0.88)'; ctx.fill();
-      ctx.fillStyle='#5aadff'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
-      ctx.fillText(`RESPAWN dans ${Math.ceil(ship.respawnTimer/60)}s`,W/2,H/2-8);
-      ctx.textAlign='left';
-    }
+  if(ship.dead&&!_mpConnected){
+    // Solo uniquement — en MP on affiche l'état du propre bot
+    rr(ctx,W/2-160,H/2-32,320,52,7); ctx.fillStyle='rgba(4,8,28,0.88)'; ctx.fill();
+    ctx.fillStyle='#5aadff'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+    ctx.fillText(`RESPAWN dans ${Math.ceil(ship.respawnTimer/60)}s`,W/2,H/2-8);
+    ctx.textAlign='left';
+  }
+  if(_mpConnected&&_mpMyShip&&_mpMyShip.dead){
+    // MP : afficher le compte à rebours du propre bot
+    rr(ctx,W/2-160,H/2-32,320,52,7); ctx.fillStyle='rgba(4,8,28,0.88)'; ctx.fill();
+    ctx.fillStyle='#5aadff'; ctx.font='bold 15px monospace'; ctx.textAlign='center';
+    ctx.fillText(`RESPAWN dans ${Math.ceil((_mpMyShip.respawnTimer||0)/60)}s`,W/2,H/2-8);
+    ctx.textAlign='left';
   }
 
   // ── Journal de combat ────────────────────────────────────────────────────
@@ -4352,20 +4350,24 @@ function loop(){
       // Host : injecter touches locales dans la map → updateNetPlayer les applique
       if(_mpIsHost&&_mpMyShip&&_mpMySlot!==null){
         _mpNetKeys.set(_mpMyTeam+'_'+_mpMySlot,
-          {up:!!keys.up,down:!!keys.down,left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
+          {left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
       }
       if(_mpIsHost){
         update(); // host tourne la simulation complète
         mpSendState();
       } else {
         // Non-host : appliquer l'état reçu du host
+        _gameTick++;  // avancer le compteur même sans update() pour les animations
         if(_mpPending){ mpApplyState(_mpPending); _mpPending=null; }
         // Extrapolation locale → fluidité 60fps pour rochers
         for(const a of ASTEROIDS){ a.wx+=a.vx; a.wy+=a.vy; a.rot+=a.rotVel; }
         for(const m of meteors){ m.x+=m.vx; m.y+=m.vy; if(m.rot!==undefined) m.rot+=m.rotVel; }
+        // Nettoyage minimal non-hôte : bullets + particles expirent correctement
+        for(let _bi=bullets.length-1;_bi>=0;_bi--){ bullets[_bi].x+=bullets[_bi].vx; bullets[_bi].y+=bullets[_bi].vy; if(--bullets[_bi].life<=0) bullets.splice(_bi,1); }
+        for(let _pi=particles.length-1;_pi>=0;_pi--){ if(--particles[_pi].life<=0) particles.splice(_pi,1); }
         // Prédiction locale du propre vaisseau (évite lag d'input)
         if(_mpMyShip&&!_mpMyShip.dead&&_mpMySlot!==null){
-          updateNetPlayer(_mpMyShip,{up:!!keys.up,down:!!keys.down,left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
+          updateNetPlayer(_mpMyShip,{left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
         }
         mpSendInput();
       }
