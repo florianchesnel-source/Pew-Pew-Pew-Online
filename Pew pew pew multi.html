@@ -278,7 +278,7 @@ function mpSendState(){
     spawns:spawns.map(s=>({team:s.team})),
     blueT:teamLives.blue, redT:teamLives.red,
     gameOver:!!gameOver,
-    asts:asteroids.slice(0,60).map(a=>({x:a.x,y:a.y,vx:a.vx,vy:a.vy})),
+    asts:ASTEROIDS.slice(0,60).map(a=>({x:a.x,y:a.y,vx:a.vx,vy:a.vy})),
     mets:meteors.map(m=>({x:m.x,y:m.y,vx:m.vx,vy:m.vy}))
   }));
 }
@@ -296,7 +296,7 @@ function mpApplyState(s){
   s.spawns.forEach((sp,i)=>{ if(spawns[i]) spawns[i].team=sp.team; });
   teamLives.blue=s.blueT; teamLives.red=s.redT;
   gameOver=s.gameOver;
-  if(s.asts) s.asts.forEach((a,i)=>{ if(asteroids[i]){asteroids[i].x=a.x;asteroids[i].y=a.y;asteroids[i].vx=a.vx;asteroids[i].vy=a.vy;} });
+  if(s.asts) s.asts.forEach((a,i)=>{ if(ASTEROIDS[i]){ASTEROIDS[i].x=a.x;ASTEROIDS[i].y=a.y;ASTEROIDS[i].vx=a.vx;ASTEROIDS[i].vy=a.vy;} });
   if(s.mets) s.mets.forEach((m,i)=>{ if(meteors[i]){meteors[i].x=m.x;meteors[i].y=m.y;meteors[i].vx=m.vx;meteors[i].vy=m.vy;} });
 }
 
