@@ -312,10 +312,10 @@ function updateNetPlayer(ai,nk){
   if(!nk) return;
   if(nk.left)  ai.angle-=0.045;
   if(nk.right) ai.angle+=0.045;
-  if(nk.up){ ai.vx+=Math.cos(ai.angle)*THRUST; ai.vy+=Math.sin(ai.angle)*THRUST; }
+  if(nk.up){ ai.vx+=Math.cos(ai.angle)*THRUST_FWD; ai.vy+=Math.sin(ai.angle)*THRUST_FWD; }
   const spd=Math.hypot(ai.vx,ai.vy);
   if(spd>MAX_SPEED){ ai.vx=ai.vx/spd*MAX_SPEED; ai.vy=ai.vy/spd*MAX_SPEED; }
-  ai.vx*=DRAG; ai.vy*=DRAG; ai.x+=ai.vx; ai.y+=ai.vy;
+  ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN; ai.x+=ai.vx; ai.y+=ai.vy;
   if(nk.fire){
     if((ai._nfTimer||0)<=0){
       const _bspd=8;
