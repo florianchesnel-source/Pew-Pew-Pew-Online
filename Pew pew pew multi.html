@@ -142,7 +142,7 @@
     <div class="smenu-sep"></div>
     <button id="mp-toggle" onclick="mpTogglePanel()">🌐 &nbsp;Mode Multijoueur</button>
     <div id="mp-panel">
-      <input id="mp-server-url" placeholder="wss://ton-app.up.railway.app" spellcheck="false" autocomplete="off">
+      <input id="mp-server-url" value="wss://pew-pew-pew-online-production.up.railway.app" spellcheck="false" autocomplete="off">
       <div class="mp-teams">
         <button class="mp-btn-blue" onclick="mpJoin('blue')">▶ Équipe Bleue</button>
         <button class="mp-btn-red"  onclick="mpJoin('red')">▶ Équipe Rouge</button>
@@ -202,17 +202,14 @@ function mpHandleMsg(msg){
   switch(msg.type){
     case 'assigned':{
       _mpMyPid=msg.pid; _mpMySlot=msg.slot; _mpMyTeam=msg.team; _mpIsHost=msg.isHost;
-      // Marquer uniquement les AUTRES joueurs, pas soi-même
-      for(const p of msg.players){
-        _mpPlayers.set(p.pid,p);
-        if(p.pid!==msg.pid) mpMarkBot(p.team,p.slot,p.name,p.pid);
-      }
+      // Marquer tous les joueurs y compris soi-même
+      for(const p of msg.players){ _mpPlayers.set(p.pid,p); mpMarkBot(p.team,p.slot,p.name,p.pid); }
       mpBegin(msg.name);
       break;
     }
     case 'player_joined':{
       _mpPlayers.set(msg.pid,msg);
-      if(msg.pid!==_mpMyPid) mpMarkBot(msg.team,msg.slot,msg.name,msg.pid);
+      mpMarkBot(msg.team,msg.slot,msg.name,msg.pid);
       break;
     }
     case 'player_left':{
@@ -247,16 +244,10 @@ function mpBegin(playerName){
   _mpMyShip=fleet[_mpMySlot]||null;
   if(_mpMyShip) _mpMyShip.name=playerName;
 
-  if(_mpIsHost){
-    ship.name=playerName;
-    _mpMyShip=null; // host joue via ship normal, pas via un bot
-  } else {
-    // Non-host : le ship traditionnel n'existe pas
-    ship.dead=true; ship.hp=0; _playerLives=0;
-    // Créer objet synthétique pour le ship du host
-    _mpHostShipObj={x:0,y:0,vx:0,vy:0,angle:0,hp:0,shield:0,dead:true,team:'blue',
-      shipType:1,radius:14,name:'HOST',_mpHostObj:true};
-  }
+  // Tout le monde (host compris) joue via un bot slot
+  // Le ship traditionnel est désactivé
+  ship.dead=true; ship.hp=0; _playerLives=0;
+
   // Lancer la partie
   const menu=document.getElementById('start-menu');
   if(menu){ menu.style.opacity='0'; menu.style.transition='opacity 0.4s'; setTimeout(()=>menu.remove(),420); }
@@ -278,26 +269,38 @@ function mpSendState(){
     spawns:spawns.map(s=>({team:s.team})),
     blueT:teamLives.blue, redT:teamLives.red,
     gameOver:!!gameOver,
-    asts:ASTEROIDS.slice(0,60).map(a=>({x:a.x,y:a.y,vx:a.vx,vy:a.vy})),
+    asts:ASTEROIDS.slice(0,60).map(a=>({x:a.wx,y:a.wy,vx:a.vx,vy:a.vy})),
     mets:meteors.map(m=>({x:m.x,y:m.y,vx:m.vx,vy:m.vy}))
   }));
 }
 
 // ── Appliquer state reçu (non-host) ──────────────────────────────────────
 function mpApplyState(s){
-  const applyShip=(obj,d)=>{ if(!obj||!d)return;
-    obj.x=d.x;obj.y=d.y;obj.vx=d.vx;obj.vy=d.vy;obj.angle=d.angle;
-    obj.hp=d.hp;if(d.maxHp)obj.maxHp=d.maxHp;obj.shield=d.shield;obj.dead=d.dead; };
-  s.blues.forEach((d,i)=>{ if(blues[i]) applyShip(blues[i],d); });
-  s.reds.forEach((d,i)=>{ if(reds[i])  applyShip(reds[i],d); });
-  if(s.hostShip&&_mpHostShipObj) applyShip(_mpHostShipObj,s.hostShip);
+  const lerpShip=(obj,d,own)=>{
+    if(!obj||!d)return;
+    const L=own?0.15:0.45;
+    obj.x=obj.x*(1-L)+d.x*L; obj.y=obj.y*(1-L)+d.y*L;
+    obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
+    obj.hp=d.hp; if(d.maxHp)obj.maxHp=d.maxHp;
+    obj.shield=d.shield; obj.dead=d.dead;
+  };
+  s.blues.forEach((d,i)=>{ if(blues[i]) lerpShip(blues[i],d,_mpMyTeam==='blue'&&i===_mpMySlot); });
+  s.reds.forEach((d,i)=>{ if(reds[i])  lerpShip(reds[i],d,_mpMyTeam==='red'&&i===_mpMySlot); });
   BEACON.x=s.beacon.x;BEACON.y=s.beacon.y;BEACON.capTeam=s.beacon.capTeam;
   BEACON.progress=s.beacon.progress;BEACON.contestTeam=s.beacon.contestTeam;
   s.spawns.forEach((sp,i)=>{ if(spawns[i]) spawns[i].team=sp.team; });
   teamLives.blue=s.blueT; teamLives.red=s.redT;
   gameOver=s.gameOver;
-  if(s.asts) s.asts.forEach((a,i)=>{ if(ASTEROIDS[i]){ASTEROIDS[i].x=a.x;ASTEROIDS[i].y=a.y;ASTEROIDS[i].vx=a.vx;ASTEROIDS[i].vy=a.vy;} });
-  if(s.mets) s.mets.forEach((m,i)=>{ if(meteors[i]){meteors[i].x=m.x;meteors[i].y=m.y;meteors[i].vx=m.vx;meteors[i].vy=m.vy;} });
+  if(s.asts) s.asts.forEach((a,i)=>{
+    const ast=ASTEROIDS[i]; if(!ast)return;
+    ast.wx=ast.wx*0.6+a.x*0.4; ast.wy=ast.wy*0.6+a.y*0.4;
+    ast.vx=a.vx; ast.vy=a.vy;
+  });
+  if(s.mets) s.mets.forEach((m,i)=>{
+    const met=meteors[i]; if(!met)return;
+    met.x=met.x*0.6+m.x*0.4; met.y=met.y*0.6+m.y*0.4;
+    met.vx=m.vx; met.vy=m.vy;
+  });
 }
 
 // ── Envoi inputs (non-host → serveur, chaque frame) ─────────────────────
@@ -308,6 +311,17 @@ function mpSendInput(){
 }
 
 // ── Contrôle bot par réseau (host side) ──────────────────────────────────
+function mpNetRespawn(ai,team){
+  if(--ai.respawnTimer>0) return;
+  const spawnPts=spawns.filter(s=>s.team===team);
+  if(!spawnPts.length) return;
+  const sp=spawnPts[Math.floor(Math.random()*spawnPts.length)];
+  ai.x=sp.x+(Math.random()-0.5)*140; ai.y=sp.y+(Math.random()-0.5)*140;
+  ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
+  ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
+  ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0;
+  ai.immuneTimer=SPAWN_IMMUNE; ai.fireTimer=60;
+}
 function updateNetPlayer(ai,nk){
   if(!nk) return;
   if(nk.left)  ai.angle-=0.045;
@@ -2289,13 +2303,17 @@ function update(){
   }
   formationActive=blues.some(a=>a.formSlot!==undefined&&!a.dead);
   for(const ai of blues){
-    if(ai._netPid!==undefined) updateNetPlayer(ai,_mpNetKeys.get('blue_'+ai._netSlot));
-    else updateAI(ai,reds);
+    if(ai._netPid!==undefined){
+      if(ai.dead){ mpNetRespawn(ai,'blue'); }
+      else updateNetPlayer(ai,_mpNetKeys.get('blue_'+ai._netSlot));
+    } else updateAI(ai,reds);
     applyGravity(ai,false); wallBounce(ai);
   }
   for(const ai of reds){
-    if(ai._netPid!==undefined) updateNetPlayer(ai,_mpNetKeys.get('red_'+ai._netSlot));
-    else updateAI(ai,[...blues,ship]);
+    if(ai._netPid!==undefined){
+      if(ai.dead){ mpNetRespawn(ai,'red'); }
+      else updateNetPlayer(ai,_mpNetKeys.get('red_'+ai._netSlot));
+    } else updateAI(ai,[...blues,ship]);
     applyGravity(ai,false); wallBounce(ai);
   }
   updateCaptures();
@@ -4058,7 +4076,7 @@ function updateCamera(){
       _spectTarget=pool[spectIdx];
     } else { _spectTarget=null; spectMode=false; }
   } else { _spectTarget=null; }
-  if(_mpMyShip&&!_mpIsHost){
+  if(_mpMyShip&&_mpConnected){
     _camX=_mpMyShip.x; _camY=_mpMyShip.y;
   } else {
     _camX=_spectTarget?_spectTarget.x:ship.x;
@@ -4330,24 +4348,29 @@ let _gameStarted=false;
 
 function loop(){
   if(_gameStarted){
-    if(!_mpConnected||_mpIsHost){
-      update(); // host ou solo : simulation complète
-    } else {
-      // Non-host : appliquer l'état reçu du host
-      if(_mpPending){ mpApplyState(_mpPending); _mpPending=null; }
-    }
-    // Sync réseau
     if(_mpConnected){
-      if(_mpIsHost) mpSendState();
-      else mpSendInput();
-    }
-    // Non-host : copier _mpMyShip dans ship pour que le HUD/caméra fonctionnent
-    if(_mpMyShip&&!_mpIsHost){
-      ship.x=_mpMyShip.x; ship.y=_mpMyShip.y;
-      ship.vx=_mpMyShip.vx; ship.vy=_mpMyShip.vy;
-      ship.angle=_mpMyShip.angle;
-      ship.hp=_mpMyShip.hp; ship.maxHp=_mpMyShip.maxHp||ship.maxHp;
-      ship.shield=_mpMyShip.shield; ship.dead=_mpMyShip.dead;
+      // Host : injecter touches locales dans la map → updateNetPlayer les applique
+      if(_mpIsHost&&_mpMyShip&&_mpMySlot!==null){
+        _mpNetKeys.set(_mpMyTeam+'_'+_mpMySlot,
+          {up:!!keys.up,down:!!keys.down,left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
+      }
+      if(_mpIsHost){
+        update(); // host tourne la simulation complète
+        mpSendState();
+      } else {
+        // Non-host : appliquer l'état reçu du host
+        if(_mpPending){ mpApplyState(_mpPending); _mpPending=null; }
+        // Extrapolation locale → fluidité 60fps pour rochers
+        for(const a of ASTEROIDS){ a.wx+=a.vx; a.wy+=a.vy; a.rot+=a.rotVel; }
+        for(const m of meteors){ m.x+=m.vx; m.y+=m.vy; if(m.rot!==undefined) m.rot+=m.rotVel; }
+        // Prédiction locale du propre vaisseau (évite lag d'input)
+        if(_mpMyShip&&!_mpMyShip.dead&&_mpMySlot!==null){
+          updateNetPlayer(_mpMyShip,{up:!!keys.up,down:!!keys.down,left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
+        }
+        mpSendInput();
+      }
+    } else {
+      update(); // solo
     }
   }
   updateCamera();
@@ -4366,10 +4389,7 @@ function loop(){
   drawParticles(); drawBullets(); drawLasers(); drawMeteors();
   drawAIFleet(blues,'#0d2060','#4080f0','#4aadff','80,150,255');
   drawAIFleet(reds, '#601010','#e04040','#ff6050','255,80,60');
-  // Non-host : dessiner le ship du host comme un vaisseau bleu supplémentaire
-  if(_mpHostShipObj&&!_mpIsHost&&!_mpHostShipObj.dead){
-    drawAIFleet([_mpHostShipObj],'#0d2060','#4080f0','#4aadff','80,150,255');
-  }
+
   drawFormationLinks(); drawPlayerShip(); drawRadarArrows(); drawMPNames();
   if(_rallyMarkers.length>0&&!ship.dead){
     const cx2=canvas.width/2, cy2=canvas.height/2;
