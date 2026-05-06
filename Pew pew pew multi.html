@@ -167,9 +167,23 @@ const _ac=(()=>{try{return new(window.AudioContext||window.webkitAudioContext)()
 let _mpWs=null, _mpConnected=false, _mpIsHost=false;
 let _mpMyPid=null, _mpMySlot=null, _mpMyTeam=null, _mpMyShip=null;
 let _mpPlayers=new Map();       // pid → {team,slot,name}
-let _mpNetKeys=new Map();       // 'blue_N' | 'red_N' → {up,dn,lt,rt,fi}
+let _mpNetKeys=new Map();       // 'blue_N' | 'red_N' → {left,right}
+let _mpNetPos=new Map();        // 'blue_N' | 'red_N' → {x,y,vx,vy,angle} position autoritaire du client
+let _mpDbgRx=0, _mpDbgTx=0;   // debug counters
+const _mpLog=[];               // journal MP debug (max 12 entrées)
+let _mpLogT0=Date.now();
+function mpLog(msg){
+  const t=((Date.now()-_mpLogT0)/1000).toFixed(1);
+  const role=(_mpIsHost?'H':'C');
+  _mpLog.unshift(`[${t}s][${role}] ${msg}`);
+  if(_mpLog.length>12) _mpLog.length=12;
+  console.log(`[MP][${role}] ${msg}`);
+}
+let _mpHostReportedX=null, _mpHostReportedY=null; // dernière position du client vue par l'host
 let _mpLastSent=0;              // ts dernier state envoyé (host)
-let _mpPending=null;            // dernier state reçu (non-host)
+let _mpPending=null;
+let _mpFirstState=true;  // snap complet sur le 1er état reçu
+let _mpAstSnapTimer=0;   // resync forcée des astéroïdes toutes les ~5s            // dernier state reçu (non-host)
 let _mpHostShipData=null;       // données du ship du host (pour les non-hosts)
 let _mpHostShipObj=null;        // objet synthétique pour le rendu
 
@@ -187,7 +201,15 @@ function mpJoin(team){
   try { _mpWs=new WebSocket(url); } catch(e){ mpStatus('URL invalide'); return; }
   _mpWs.onopen=()=>{ _mpConnected=true; mpStatus('Connecté — rejoindre équipe '+team+'…'); _mpWs.send(JSON.stringify({type:'join',team,name})); };
   _mpWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} mpHandleMsg(m); };
-  _mpWs.onclose=()=>{ _mpConnected=false; mpStatus('Déconnecté'); };
+  _mpWs.onclose=()=>{
+    _mpConnected=false; mpStatus('Déconnecté');
+    mpLog('❌ Déconnecté du serveur');
+    // Éviter que le mode spectateur solo s'active après déconnexion MP
+    // (ship.dead=true est mis dans mpBegin, il faut le réinitialiser)
+    ship.dead=false; ship.hp=100;
+    // Afficher une notification de déconnexion à l'écran
+    playerFeedback.push({type:'notif',label:'⚠ Déconnecté',life:300,maxLife:300});
+  };
   _mpWs.onerror=()=>{ mpStatus('Erreur de connexion — verifiez l URL'); };
 }
 
@@ -195,6 +217,7 @@ function mpHandleMsg(msg){
   switch(msg.type){
     case 'assigned':{
       _mpMyPid=msg.pid; _mpMySlot=msg.slot; _mpMyTeam=msg.team; _mpIsHost=msg.isHost;
+      mpLog(`✅ Assigné pid=${msg.pid} équipe=${msg.team} slot=${msg.slot} host=${msg.isHost}`);
       // Marquer tous les joueurs y compris soi-même
       for(const p of msg.players){ _mpPlayers.set(p.pid,p); mpMarkBot(p.team,p.slot,p.name,p.pid); }
       mpBegin(msg.name);
@@ -213,6 +236,26 @@ function mpHandleMsg(msg){
     case 'promoted_host':{ _mpIsHost=true; break; }
     case 'input':{
       _mpNetKeys.set(msg.team+'_'+msg.slot,msg.keys);
+      if(msg.x!==undefined){
+        // CLIENT envoie aussi son propre état (hp, dead) → modèle relay : HOST fait confiance
+        _mpNetPos.set(msg.team+'_'+msg.slot,{x:msg.x,y:msg.y,vx:msg.vx||0,vy:msg.vy||0,
+          angle:msg.angle||0,angVel:msg.angVel||0,_fresh:true,
+          hp:msg.hp,dead:msg.dead,respawnTimer:msg.respawnTimer,
+          immuneTimer:msg.immuneTimer,shield:msg.shield});
+        _mpDbgRx=((_mpDbgRx||0)+1);
+      }
+      // Balles tirées par le CLIENT ce frame → ajoutées à la simulation de l'hôte
+      if(msg.bul&&msg.bul.length&&typeof bullets!=='undefined'){
+        const _cfl=msg.team==='blue'?blues:reds;
+        const _cai=_cfl[msg.slot];
+        for(const _cb of msg.bul){
+          if(bullets.length<(typeof MAX_BULLETS!=='undefined'?MAX_BULLETS:400)){
+            bullets.push({x:_cb[0],y:_cb[1],vx:_cb[2],vy:_cb[3],
+              team:msg.team,life:typeof BULLET_LIFE!=='undefined'?BULLET_LIFE:80,
+              target:null,shooter:_cai||null,homing:false,zeroDmg:false});
+          }
+        }
+      }
       break;
     }
     case 'state':{
@@ -225,11 +268,23 @@ function mpHandleMsg(msg){
 
 function mpMarkBot(team,slot,name,pid){
   const fl=team==='blue'?blues:reds;
-  if(slot<fl.length){ fl[slot]._netPid=pid; fl[slot]._netSlot=slot; fl[slot]._netTeam=team; fl[slot].name=name; }
+  if(slot<fl.length){
+    fl[slot]._netPid=pid; fl[slot]._netSlot=slot; fl[slot]._netTeam=team; fl[slot].name=name;
+    // Si ce slot a été tué par le mode test, le réanimer pour le joueur
+    if(fl[slot].dead&&(fl[slot].respawnTimer||0)>=999999){
+      fl[slot].dead=false; fl[slot].hp=fl[slot].maxHp;
+      fl[slot].shield=fl[slot].maxShield??SHIELD_MAX;
+      fl[slot].respawnTimer=0; fl[slot].immuneTimer=SPAWN_IMMUNE;
+    }
+  }
 }
 function mpUnmarkBot(team,slot){
   const fl=team==='blue'?blues:reds;
-  if(slot<fl.length){ delete fl[slot]._netPid; delete fl[slot]._netSlot; delete fl[slot]._netTeam; }
+  if(slot<fl.length){
+    delete fl[slot]._netPid; delete fl[slot]._netSlot; delete fl[slot]._netTeam;
+    // Geler le slot : empêcher qu'il devienne un bot actif
+    fl[slot].dead=true; fl[slot].respawnTimer=999999;
+  }
 }
 
 function mpBegin(playerName){
@@ -241,6 +296,19 @@ function mpBegin(playerName){
   // Le ship traditionnel est désactivé
   ship.dead=true; ship.hp=0; _playerLives=0;
 
+  // Mode MP : retirer astéroïdes, météores et stations (solo uniquement)
+  if(_mpConnected){ ASTEROIDS.length=0; meteors.length=0; meteorWarn=0; meteorNotif=0; spawns.length=0; }
+  // MAP TEST : tuer tous les bots non-joueurs sauf un bot cible rouge invincible
+  for(const ai of blues) if(!ai._netPid){ ai.dead=true; ai.respawnTimer=999999; }
+  let _testBotSet=false;
+  for(const ai of reds){
+    if(!ai._netPid){
+      if(!_testBotSet){ ai._testBot=true; ai.dead=false; ai.hp=ai.maxHp; ai.immuneTimer=0; _testBotSet=true; }
+      else { ai.dead=true; ai.respawnTimer=999999; }
+    }
+  }
+  // Réinitialiser l'état de fin de partie
+  gameOver=null;
   // Lancer la partie
   const menu=document.getElementById('start-menu');
   if(menu){ menu.style.opacity='0'; menu.style.transition='opacity 0.4s'; setTimeout(()=>menu.remove(),420); }
@@ -251,87 +319,276 @@ function mpBegin(playerName){
 // ── Envoi state (host → clients, ~100ms) ──────────────────────────────────
 function mpSendState(){
   if(!_mpIsHost||!_mpWs||_mpWs.readyState!==1) return;
-  const now=Date.now(); if(now-_mpLastSent<100) return; _mpLastSent=now;
-  const ser=s=>s?{x:s.x,y:s.y,vx:s.vx,vy:s.vy,angle:s.angle,hp:s.hp,maxHp:s.maxHp,
-    shield:s.shield,dead:s.dead,shipType:s.shipType,team:s.team,name:s.name}:null;
+  const now=Date.now(); if(now-_mpLastSent<16) return; _mpLastSent=now;
+  const ser=s=>s?{x:s.x,y:s.y,vx:s.vx,vy:s.vy,angle:s.angle,angVel:+(s.angVel||0).toFixed(4),
+    hp:s.hp,maxHp:s.maxHp,hit:s.hit||0,
+    shield:s.shield,shieldHit:s.shieldHit||0,shieldTimer:s.shieldTimer||0,
+    immuneTimer:s.immuneTimer||0,
+    dead:s.dead,respawnTimer:s.respawnTimer||0,shipType:s.shipType,team:s.team,name:s.name,
+    isMercenary:!!s.isMercenary}:null;
   _mpWs.send(JSON.stringify({
     type:'state',
     blues:blues.map(ser), reds:reds.map(ser),
     hostShip:ser(ship),
     beacon:{x:BEACON.x,y:BEACON.y,capTeam:BEACON.capTeam,progress:BEACON.progress,contestTeam:BEACON.contestTeam},
-    spawns:spawns.map(s=>({team:s.team})),
+    spawns:spawns.map(s=>({team:s.team,x:s.x,y:s.y,capTeam:s.capTeam,progress:s.progress,
+      turrets:s.turrets.map(t=>({angle:+t.angle.toFixed(3),hp:t.hp,respawnTimer:t.respawnTimer||0}))})),
+    rally:_rallyNotif?{type:_rallyNotif.type,life:_rallyNotif.life,maxLife:_rallyNotif.maxLife,lines:_rallyNotif.lines}:null,
+    logs:gameLog.map(e=>({parts:e.parts,seq:e.seq})),
     blueT:teamLives.blue, redT:teamLives.red,
     gameOver:!!gameOver,
-    asts:ASTEROIDS.slice(0,60).map(a=>({x:a.wx,y:a.wy,vx:a.vx,vy:a.vy})),
-    mets:meteors.map(m=>({x:m.x,y:m.y,vx:m.vx,vy:m.vy}))
+    // Balles : format compact [x,y,vx,vy,team(0=bleu/1=rouge),life,zeroDmg]
+    bul:bullets.map(b=>[Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2),b.team==='blue'?0:1,b.life,b.zeroDmg?1:0]),
+    pk:pickups.map(p=>[Math.round(p.x),Math.round(p.y),p.life]),
   }));
 }
 
 // ── Appliquer state reçu (non-host) ──────────────────────────────────────
+// Interpolation angulaire (gère le passage ±π)
+function _lerpAngle(cur, tgt, t){
+  let da=tgt-cur;
+  while(da>Math.PI) da-=Math.PI*2;
+  while(da<-Math.PI) da+=Math.PI*2;
+  return cur+da*t;
+}
 function mpApplyState(s){
   const lerpShip=(obj,d,own)=>{
     if(!obj||!d)return;
-    const L=own?0.15:0.45;
-    obj.x=obj.x*(1-L)+d.x*L; obj.y=obj.y*(1-L)+d.y*L;
-    obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
-    obj.hp=d.hp; if(d.maxHp)obj.maxHp=d.maxHp;
-    obj.shield=d.shield; obj.dead=d.dead;
+    if(own){
+      // Position : le client est autoritaire — pas de correction depuis l'hôte
+      // Exception : premier état (position initiale) et respawn
+      if(_mpFirstState){
+        obj.x=d.x; obj.y=d.y; obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
+      }
+      // Mémoriser la position reportée par l'hôte (référentiel des balles)
+      _mpHostReportedX=d.x; _mpHostReportedY=d.y;
+      // Modèle relay : CLIENT est autoritaire pour sa propre mort/respawn
+      // HOST transmet bouclier et hit pour les feedbacks visuels
+      if(!obj.dead){ // seulement si vivant — éviter d'écraser l'état mort local
+        if(d.hit>0&&(obj.hit||0)<d.hit) obj.hit=d.hit;
+        obj.shield=d.shield;
+        if(d.shieldHit!==undefined) obj.shieldHit=d.shieldHit;
+        if(d.shieldTimer!==undefined) obj.shieldTimer=d.shieldTimer;
+      }
+      // Mort/respawn : CLIENT décide lui-même (via collision locale), HOST ne l'écrase pas
+      // Exception : HOST confirme un respawn (dead=false alors que CLIENT est mort ET son timer est épuisé)
+      if(!d.dead&&obj.dead&&obj.respawnTimer<=0){
+        // HOST a respawné le vaisseau ET le CLIENT n'attend plus → accepter position du HOST
+        mpLog(`CLIENT: respawn HOST accepté (timer=0) pos=${Math.round(d.x)},${Math.round(d.y)}`);
+        obj.dead=false; obj.respawnTimer=0;
+        obj.x=d.x; obj.y=d.y; obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
+      }
+    } else {
+      // Autres vaisseaux — lerp direct vers la position rapportée
+      const _dist=Math.hypot(d.x-obj.x,d.y-obj.y);
+      if(_mpFirstState||_dist>400||(d.dead===false&&obj.dead)){
+        obj.x=d.x; obj.y=d.y;
+      } else {
+        const _lr=_dist>80?0.85:_dist>20?0.6:0.35;
+        obj.x+=(d.x-obj.x)*_lr; obj.y+=(d.y-obj.y)*_lr;
+      }
+      obj.vx=d.vx; obj.vy=d.vy;
+      obj.angVel=d.angVel||0;
+      obj.angle=(_mpFirstState||(d.dead===false&&obj.dead))
+        ? d.angle
+        : _lerpAngle(obj.angle,d.angle,0.4);
+      obj.hp=d.hp; if(d.maxHp)obj.maxHp=d.maxHp;
+      if(d.hit>0&&(obj.hit||0)<d.hit) obj.hit=d.hit;
+      obj.shield=d.shield;
+      // Explosion locale quand un vaisseau meurt (transition alive→dead détectée)
+      if(d.dead&&!obj.dead){ addExplosion(d.x,d.y,d.team||obj.team); playSound('explode',0.55,d.x,d.y); }
+      // Particules de spawn quand un vaisseau respawn (dead→alive détectée)
+      if(!d.dead&&obj.dead){ addExplosion(d.x,d.y,d.team||obj.team); }
+      obj.dead=d.dead;
+      obj.respawnTimer=d.respawnTimer||0;
+      obj.immuneTimer=d.immuneTimer||0;
+      if(d.shieldHit!==undefined) obj.shieldHit=d.shieldHit;
+      if(d.shieldTimer!==undefined) obj.shieldTimer=d.shieldTimer;
+    }
   };
-  s.blues.forEach((d,i)=>{ if(blues[i]) lerpShip(blues[i],d,_mpMyTeam==='blue'&&i===_mpMySlot); });
-  s.reds.forEach((d,i)=>{ if(reds[i])  lerpShip(reds[i],d,_mpMyTeam==='red'&&i===_mpMySlot); });
+  s.blues.forEach((d,i)=>{
+    if(!blues[i]&&d&&!d.dead){
+      // Mercenaire créé sur l'hôte : ajouter côté non-hôte
+      const _nb=mkAI('blue',d.shipType||1); _nb.x=d.x; _nb.y=d.y;
+      _nb.vx=d.vx; _nb.vy=d.vy; _nb.angle=d.angle;
+      _nb.hp=d.hp; _nb.maxHp=d.maxHp||_nb.maxHp; _nb.dead=false;
+      _nb.isMercenary=d.isMercenary||false;
+      if(d.name) _nb.name=d.name; blues.push(_nb);
+    }
+    if(blues[i]){
+      blues[i].isMercenary=!!d.isMercenary;
+      lerpShip(blues[i],d,_mpMyTeam==='blue'&&i===_mpMySlot);
+    }
+  });
+  s.reds.forEach((d,i)=>{
+    if(!reds[i]&&d&&!d.dead){
+      const _nr=mkAI('red',d.shipType||1); _nr.x=d.x; _nr.y=d.y;
+      _nr.vx=d.vx; _nr.vy=d.vy; _nr.angle=d.angle;
+      _nr.hp=d.hp; _nr.maxHp=d.maxHp||_nr.maxHp; _nr.dead=false;
+      _nr.isMercenary=d.isMercenary||false;
+      if(d.name) _nr.name=d.name; reds.push(_nr);
+    }
+    if(reds[i]){
+      reds[i].isMercenary=!!d.isMercenary;
+      lerpShip(reds[i],d,_mpMyTeam==='red'&&i===_mpMySlot);
+    }
+  });
+  // _mpFirstState reset à la fin de mpApplyState (après asts/mets)
   BEACON.x=s.beacon.x;BEACON.y=s.beacon.y;BEACON.capTeam=s.beacon.capTeam;
   BEACON.progress=s.beacon.progress;BEACON.contestTeam=s.beacon.contestTeam;
-  s.spawns.forEach((sp,i)=>{ if(spawns[i]) spawns[i].team=sp.team; });
+  s.spawns.forEach((sp,i)=>{
+    if(!spawns[i]) return;
+    spawns[i].team=sp.team;
+    spawns[i].capTeam=sp.capTeam||null;
+    spawns[i].progress=sp.progress||0;
+    if(sp.x!==undefined&&(_mpFirstState||Math.hypot(sp.x-spawns[i].x,sp.y-spawns[i].y)>50)){
+      spawns[i].x=sp.x; spawns[i].y=sp.y;
+    }
+    // Sync tourelles : angle lerp doux + hp + respawn
+    if(sp.turrets&&spawns[i].turrets){
+      sp.turrets.forEach((td,ti)=>{
+        const t=spawns[i].turrets[ti]; if(!t) return;
+        t.angle=_mpFirstState?td.angle:_lerpAngle(t.angle,td.angle,0.4);
+        t.hp=td.hp; t.respawnTimer=td.respawnTimer||0;
+      });
+    }
+  });
+  // Log : ajouter les nouveaux messages que le non-hôte n'a pas encore
+  if(s.logs){
+    for(const e of s.logs){
+      if(e.seq>_mpLogSeqSeen){
+        _mpLogSeqSeen=e.seq;
+        gameLog.unshift({parts:e.parts,life:420,maxLife:420,seq:e.seq});
+        if(gameLog.length>10) gameLog.length=10;
+      }
+    }
+  }
+  // Bannière rally (offensive/défensive) : afficher côté non-hôte
+  if(s.rally){
+    if(!_rallyNotif||_rallyNotif.type!==s.rally.type) _rallyNotif=s.rally;
+    else _rallyNotif.life=s.rally.life; // rafraîchir la durée depuis l'hôte
+  } else if(!s.rally&&_rallyNotif){
+    // L'hôte n'a plus de notif → laisser la locale finir de décliner
+  }
   teamLives.blue=s.blueT; teamLives.red=s.redT;
   gameOver=s.gameOver;
-  if(s.asts) s.asts.forEach((a,i)=>{
-    const ast=ASTEROIDS[i]; if(!ast)return;
-    ast.wx=ast.wx*0.6+a.x*0.4; ast.wy=ast.wy*0.6+a.y*0.4;
-    ast.vx=a.vx; ast.vy=a.vy;
-  });
-  if(s.mets) s.mets.forEach((m,i)=>{
-    const met=meteors[i]; if(!met)return;
-    met.x=met.x*0.6+m.x*0.4; met.y=met.y*0.6+m.y*0.4;
-    met.vx=m.vx; met.vy=m.vy;
-  });
+  // Balles : remplacer le tableau local par l'état autoritaire de l'hôte
+  if(s.bul){
+    bullets.length=0;
+    for(const b of s.bul){
+      bullets.push({x:b[0],y:b[1],vx:b[2],vy:b[3],team:b[4]===0?'blue':'red',life:b[5],zeroDmg:!!b[6]});
+    }
+
+  }
+  // Pickups : sync complet depuis l'hôte (les pickups collectés disparaissent naturellement)
+  if(s.pk){
+    // Conserver la rotation locale des pickups existants (juste visuel)
+    const _pkMap=new Map(pickups.map(p=>[Math.round(p.x)+'_'+Math.round(p.y),p.rot||0]));
+    pickups.length=0;
+    for(const p of s.pk){
+      const _rot=_pkMap.get(p[0]+'_'+p[1])||0;
+      pickups.push({x:p[0],y:p[1],life:p[2],rot:_rot});
+    }
+  }
+  if(_mpFirstState) _mpFirstState=false;
 }
 
 // ── Envoi inputs (non-host → serveur, chaque frame) ─────────────────────
+let _mpLastInput=0, _mpClientNewBullets=[];
 function mpSendInput(){
   if(_mpIsHost||!_mpWs||_mpWs.readyState!==1) return;
+  const _now=Date.now(); if(_now-_mpLastInput<16) return; _mpLastInput=_now; // ~60fps
+  const _mis=_mpMyShip;
+  // Garde NaN : si la position du vaisseau est corrompue, on loggue et on passe
+  if(_mis&&(isNaN(_mis.x)||isNaN(_mis.y))){
+    mpLog(`⚠ NaN détecté ship pos → reset x=${_mis.x} y=${_mis.y}`);
+    _mis.x=0; _mis.y=0; _mis.vx=0; _mis.vy=0;
+  }
+  _mpDbgTx=((_mpDbgTx||0)+1);
   _mpWs.send(JSON.stringify({type:'input',
-    keys:{left:!!keys.left,right:!!keys.right,fire:!!keys.fire}}));
+    keys:{left:!!keys.left,right:!!keys.right},
+    x:_mis?+_mis.x.toFixed(1):undefined,
+    y:_mis?+_mis.y.toFixed(1):undefined,
+    vx:_mis?+_mis.vx.toFixed(3):undefined,
+    vy:_mis?+_mis.vy.toFixed(3):undefined,
+    angle:_mis?+_mis.angle.toFixed(4):undefined,
+    angVel:_mis?+(_mis.angVel||0).toFixed(5):undefined,
+    // CLIENT rapporte son propre état → HOST fait confiance (modèle relay)
+    hp:_mis?_mis.hp:undefined,
+    dead:_mis?!!_mis.dead:undefined,
+    respawnTimer:_mis?(_mis.respawnTimer||0):undefined,
+    immuneTimer:_mis?(_mis.immuneTimer||0):undefined,
+    shield:_mis?_mis.shield:undefined,
+    // Balles tirées par le CLIENT ce frame → l'hôte les ajoute à sa simulation
+    bul:_mpClientNewBullets.length?_mpClientNewBullets:undefined,
+    slot:_mpMySlot,team:_mpMyTeam}));
+  _mpClientNewBullets=[];
 }
 
 // ── Contrôle bot par réseau (host side) ──────────────────────────────────
 function mpNetRespawn(ai,team){
   if(--ai.respawnTimer>0) return;
-  const spawnPts=spawns.filter(s=>s.team===team);
-  if(!spawnPts.length) return;
+  if(_mpConnected) mpLog(`RESPAWN ${ai.name||'?'} (${team}) timer épuisé`);
+  // Priorité : T3 alliés vivants → stations capturées → bases initiales (fallback garanti)
+  const _t3live=(team==='blue'?blues:reds).filter(a=>!a.dead&&a.shipType===3);
+  const _stations=spawns.filter(s=>s.team===team);
+  const _bases=team==='blue'?T3_BLUE_STARTS:T3_RED_STARTS;
+  const spawnPts=[..._t3live.map(a=>({x:a.x,y:a.y})),..._stations,..._bases];
   const sp=spawnPts[Math.floor(Math.random()*spawnPts.length)];
-  ai.x=sp.x+(Math.random()-0.5)*140; ai.y=sp.y+(Math.random()-0.5)*140;
-  ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
+  ai.x=sp.x+(Math.random()-0.5)*160; ai.y=sp.y+(Math.random()-0.5)*160;
+  ai.vx=ai.vy=ai.angVel=0; ai.angle=team==='blue'?-Math.PI/2:Math.PI/2;
   ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
   ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0;
   ai.immuneTimer=SPAWN_IMMUNE; ai.fireTimer=60;
 }
-function updateNetPlayer(ai,nk){
-  if(!nk) return;
-  // Physique identique à applyPhysics(ai, nk.left, nk.right) :
-  // clic gauche seul → pivot gauche + micro-thrust
-  // clic droit seul  → pivot droit  + micro-thrust
-  // les deux clics   → thrust avant plein
-  applyPhysics(ai, !!nk.left, !!nk.right);
-  if(nk.fire){
-    if((ai._nfTimer||0)<=0){
-      const _bspd=8;
-      bullets.push({x:ai.x+Math.cos(ai.angle)*16,y:ai.y+Math.sin(ai.angle)*16,
-        vx:Math.cos(ai.angle)*_bspd+ai.vx*0.2,vy:Math.sin(ai.angle)*_bspd+ai.vy*0.2,
-        team:ai.team,life:BULLET_LIFE,target:null,owner:'ai',shooter:ai,homing:false});
-      ai._nfTimer=12;
+function updateNetPlayer(ai,nk,_noBullets,_skipPhysics){
+  if(!nk&&!_skipPhysics) return;
+  // Timers visuels/état (normalement gérés dans updateAI, il faut les faire ici aussi)
+  if(ai.hit>0) ai.hit--;
+  if(ai.immuneTimer>0) ai.immuneTimer--;
+  if(ai.shieldHit>0) ai.shieldHit--;
+  if(ai.speedBoost>0) ai.speedBoost--;
+  // Régénération bouclier complète (évite le flash blanc permanent + recharge côté non-hôte)
+  if(ai.shieldTimer>0){
+    const _sMax=ai.maxShield??SHIELD_MAX;
+    if(--ai.shieldTimer===0 && ai.shield<_sMax){
+      ai.shield++;
+      if(ai.shield<_sMax) ai.shieldTimer=SHIELD_REGEN;
     }
   }
-  if(ai._nfTimer>0) ai._nfTimer--;
+  // Physique : seulement si non géré par le client (_skipPhysics=false)
+  if(!_skipPhysics&&nk) applyPhysics(ai, !!nk.left, !!nk.right);
+  // Côté non-hôte : pas de création locale de balles (tout vient de l'état hôte)
+  if(_noBullets) return;
+  // Tir auto-ciblage (même logique que l'IA, aucun bouton dédié)
+  const _foes=ai.team==='blue'?reds:blues;
+  if(ai.burstLeft>0){
+    if(--ai.burstTimer<=0){
+      if(bullets.length<MAX_BULLETS){
+        bullets.push({x:ai.x,y:ai.y,
+          vx:Math.cos(ai.angle)*BULLET_SPEED+ai.vx*0.25,
+          vy:Math.sin(ai.angle)*BULLET_SPEED+ai.vy*0.25,
+          team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,
+          shooter:ai,wx:ai.x,wy:ai.y,homing:false});
+        sfxShoot(ai.x,ai.y);
+      }
+      ai.burstLeft--; ai.burstTimer=BURST_DELAY;
+    }
+  } else {
+    let _bDist=FIRE_RANGE, _bTgt=null;
+    for(const _e of _foes){ if(_e.dead) continue; const _d=Math.hypot(_e.x-ai.x,_e.y-ai.y); if(_d<_bDist){_bDist=_d;_bTgt=_e;} }
+    if(_bTgt){
+      ai.fireTimer=(ai.fireTimer||0)-1;
+      const _t2=Math.min(_bDist/BULLET_SPEED,45);
+      let _fd=Math.atan2(_bTgt.y+_bTgt.vy*_t2-ai.y,_bTgt.x+_bTgt.vx*_t2-ai.x)-ai.angle;
+      while(_fd>Math.PI)_fd-=Math.PI*2; while(_fd<-Math.PI)_fd+=Math.PI*2;
+      if((ai.fireTimer||0)<=0&&Math.abs(_fd)<0.35){
+        ai.burstLeft=ai.burstSz||BURST_SIZE; ai.burstTimer=1;
+        ai.fireTimer=Math.max(16,BURST_CD+Math.floor(Math.random()*12));
+        ai.burstTarget=_bTgt;
+      }
+    }
+  }
 }
 // ══════════════════════════════════════════════════════════════════
 
@@ -679,36 +936,49 @@ if(isMobile){
   },{once:true,passive:true});
 }
 
+// ── PRNG seedé (mulberry32) — même seed sur tous les clients ─────────────
+// La graine est fixe → tous les clients génèrent le même monde
+const _WORLD_SEED = 0xDEADBEEF;
+let _prngState = _WORLD_SEED;
+function _rng(){
+  _prngState = (_prngState + 0x6D2B79F5) >>> 0;
+  let t = Math.imul(_prngState ^ (_prngState >>> 15), 1 | _prngState);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) >>> 0;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+// Réinitialiser pour la génération du monde
+_prngState = _WORLD_SEED;
+
 // ── Étoiles ───────────────────────────────────────────────────────────────
 const STARS = Array.from({length:200}, ()=>({
-  x:Math.random()*3200-1600, y:Math.random()*3200-1600,
-  r:Math.random()*1.5+0.2, alpha:Math.random()*0.7+0.2, p:Math.random()*0.28+0.04,
+  x:_rng()*3200-1600, y:_rng()*3200-1600,
+  r:_rng()*1.5+0.2, alpha:_rng()*0.7+0.2, p:_rng()*0.28+0.04,
 }));
 
 // ── Astéroïdes ────────────────────────────────────────────────────────────
 let _aId=0;
 function makeAsteroid(wx,wy){
-  const radius=24+Math.random()*58, pts=7+Math.floor(Math.random()*6), verts=[];
-  const rot=(Math.random())*Math.PI*2, rotVel=(Math.random()-0.5)*0.008;
+  const radius=24+_rng()*58, pts=7+Math.floor(_rng()*6), verts=[];
+  const rot=(_rng())*Math.PI*2, rotVel=(_rng()-0.5)*0.008;
   for(let j=0;j<pts;j++){
-    const a=(j/pts)*Math.PI*2+(Math.random()-0.5)*0.38, r=radius*(0.86+Math.random()*0.18);
+    const a=(j/pts)*Math.PI*2+(_rng()-0.5)*0.38, r=radius*(0.86+_rng()*0.18);
     verts.push([Math.cos(a)*r, Math.sin(a)*r]);
   }
-  const vx=(Math.random()-0.5)*0.35, vy=(Math.random()-0.5)*0.35;
+  const vx=(_rng()-0.5)*0.35, vy=(_rng()-0.5)*0.35;
   const _ahp=rockHp(radius);
   return {wx,wy,radius,verts,vx,vy,rot,rotVel,id:_aId++,hp:_ahp,maxHp:_ahp};
 }
 const ASTEROIDS=[];
 while(ASTEROIDS.length<220){
-  const wx=(Math.random()-0.5)*MAP_HALF*1.85, wy=(Math.random()-0.5)*MAP_HALF*1.85;
+  const wx=(_rng()-0.5)*MAP_HALF*1.85, wy=(_rng()-0.5)*MAP_HALF*1.85;
   if(Math.hypot(wx,wy)>320 && Math.hypot(wx-PLANET.x,wy-PLANET.y)>PLANET.r+80)
     ASTEROIDS.push(makeAsteroid(wx,wy));
 }
 // ── Ceintures d'astéroïdes ────────────────────────────────────────────────
 // Ceinture Nord : couloirs à x≈±-2400 et x≈+2400 (larges corridors)
 for(let i=0;i<70;i++){
-  const wx=(Math.random()-0.5)*MAP_HALF*1.6;
-  const wy=-1800+(Math.random()-0.5)*420;
+  const wx=(_rng()-0.5)*MAP_HALF*1.6;
+  const wy=-1800+(_rng()-0.5)*420;
   // Deux gaps : corridors vers la planète
   if((wx>-3000&&wx<-1800)||(wx>1800&&wx<3000)) continue;
   if(Math.hypot(wx,wy)<500) continue; // ne pas bloquer le centre
@@ -716,16 +986,16 @@ for(let i=0;i<70;i++){
 }
 // Ceinture Sud : gap central unique (force combat via planète)
 for(let i=0;i<70;i++){
-  const wx=(Math.random()-0.5)*MAP_HALF*1.6;
-  const wy=1800+(Math.random()-0.5)*420;
+  const wx=(_rng()-0.5)*MAP_HALF*1.6;
+  const wy=1800+(_rng()-0.5)*420;
   if(wx>-2200&&wx<2200) continue; // grand couloir central
   if(Math.hypot(wx-PLANET.x,wy-PLANET.y)>PLANET.r+90) ASTEROIDS.push(makeAsteroid(wx,wy));
 }
 // ── Champs de débris (épaves fixes, plus grandes) ─────────────────────────
 for(const [dpx,dpy] of [[-2000,-2200],[2200,-2000],[-1800,2300],[2400,2100],[-5000,0],[5000,0]]){
   for(let i=0;i<7;i++){
-    const a=makeAsteroid(dpx+(Math.random()-0.5)*280, dpy+(Math.random()-0.5)*220);
-    a.radius=55+Math.random()*55; a.vx=0; a.vy=0; a.rotVel=0;
+    const a=makeAsteroid(dpx+(_rng()-0.5)*280, dpy+(_rng()-0.5)*220);
+    a.radius=55+_rng()*55; a.vx=0; a.vy=0; a.rotVel=0;
     ASTEROIDS.push(a);
   }
 }
@@ -872,11 +1142,11 @@ function updateAsteroids(){
 function mkSpawn(x,y){
   // 1 tourelle centrale + 1 au bout de chaque bras (0°,90°,180°,270°)
   const turrets=[
-    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:0,offsetRadius:0, angle:Math.random()*Math.PI*2,fireTimer:40+Math.floor(Math.random()*40)},
-    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:0,           offsetRadius:30,angle:Math.random()*Math.PI*2,fireTimer:50+Math.floor(Math.random()*40),burstLeft:0,burstTimer:0},
-    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI/2,   offsetRadius:30,angle:Math.random()*Math.PI*2,fireTimer:60+Math.floor(Math.random()*40),burstLeft:0,burstTimer:0},
-    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI,     offsetRadius:30,angle:Math.random()*Math.PI*2,fireTimer:70+Math.floor(Math.random()*40),burstLeft:0,burstTimer:0},
-    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI*1.5, offsetRadius:30,angle:Math.random()*Math.PI*2,fireTimer:80+Math.floor(Math.random()*40),burstLeft:0,burstTimer:0},
+    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:0,offsetRadius:0, angle:_rng()*Math.PI*2,fireTimer:40+Math.floor(_rng()*40)},
+    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:0,           offsetRadius:30,angle:_rng()*Math.PI*2,fireTimer:50+Math.floor(_rng()*40),burstLeft:0,burstTimer:0},
+    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI/2,   offsetRadius:30,angle:_rng()*Math.PI*2,fireTimer:60+Math.floor(_rng()*40),burstLeft:0,burstTimer:0},
+    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI,     offsetRadius:30,angle:_rng()*Math.PI*2,fireTimer:70+Math.floor(_rng()*40),burstLeft:0,burstTimer:0},
+    {hp:2,maxHp:2,respawnTimer:0,offsetAngle:Math.PI*1.5, offsetRadius:30,angle:_rng()*Math.PI*2,fireTimer:80+Math.floor(_rng()*40),burstLeft:0,burstTimer:0},
   ];
   return{x,y,team:'neutral',progress:0,capTeam:null,
     turrets, vx:0,vy:0,dead:false,radius:SPAWN_RADIUS,_isSpawn:true};
@@ -891,7 +1161,7 @@ const _ALL_SP=[
   {x:-2200,y:-1400},{x:2200,y:1400},
 ];
 for(const p of _ALL_SP){
-  let nx=p.x+(Math.random()-0.5)*300,ny=p.y+(Math.random()-0.5)*300;
+  let nx=p.x+(_rng()-0.5)*300,ny=p.y+(_rng()-0.5)*300;
   const nd=Math.hypot(nx,ny)||0.01,nMax=MAP_RADIUS-500;
   if(nd>nMax){nx=nx/nd*nMax;ny=ny/nd*nMax;}
   if(Math.hypot(nx,ny)<900){const _nf=Math.hypot(nx,ny)||0.01;nx=nx/_nf*950;ny=ny/_nf*950;}
@@ -940,11 +1210,13 @@ function nextDroneName(){
   return l1+l2+'-'+n;
 }
 const gameLog=[];
+let _logSeq=0;           // séquence globale pour synchro MP
+let _mpLogSeqSeen=0;     // dernier seq reçu côté non-hôte
 const TCOL={blue:'#4aadff',red:'#ff6050'};
 function teamCol(team){ return TCOL[team]||'#ffffff'; }
 // parts = [{text, col}, ...]
 function addLog(parts){
-  gameLog.unshift({parts,life:420,maxLife:420});
+  gameLog.unshift({parts,life:420,maxLife:420,seq:++_logSeq});
   if(gameLog.length>10) gameLog.length=10;
 }
 
@@ -961,8 +1233,8 @@ function mkAI(team,shipType=1,startPos=null){
   const fr=spawns.filter(s=>s.team===team);
   // Si pas de spawn capturé : répartir les vaisseaux autour des positions T3
   const _t3bases=team==='blue'?T3_BLUE_STARTS:T3_RED_STARTS;
-  const _fbk=_t3bases[Math.floor(Math.random()*_t3bases.length)];
-  const sp=startPos??(fr.length?fr[Math.floor(Math.random()*fr.length)]:_fbk);
+  const _fbk=_t3bases[Math.floor(_rng()*_t3bases.length)];
+  const sp=startPos??(fr.length?fr[Math.floor(_rng()*fr.length)]:_fbk);
   const isT3=shipType===3;
   const ms=isT3?TYPE3_SHIELD:(shipType===2?TYPE2_SHIELD:SHIELD_MAX);
   const hp=isT3?TYPE3_HP:(shipType===2?TYPE2_HP:AI_HP);
@@ -972,24 +1244,24 @@ function mkAI(team,shipType=1,startPos=null){
   const angMult=shipType===2?TYPE2_ANG:isT3?TYPE3_ANGMLT:1;
   const burstSz=shipType===1?TYPE1_BURST:BURST_SIZE;
   return {
-    x:sp.x+(Math.random()-0.5)*120, y:sp.y+(Math.random()-0.5)*120,
-    vx:0, vy:0, angle:Math.random()*Math.PI*2, angVel:0,
+    x:sp.x+(_rng()-0.5)*120, y:sp.y+(_rng()-0.5)*120,
+    vx:0, vy:0, angle:team==='blue'?-Math.PI/2:Math.PI/2, angVel:0,
     team, hp, shipType, radius,
     speedMult, thrustMult, angMult, burstSz,
     shield:ms, maxShield:ms, shieldTimer:0, shieldHit:0,
     burstLeft:0, burstTimer:0, burstTarget:null,
-    fireTimer:BURST_CD+Math.floor(Math.random()*80),
+    fireTimer:BURST_CD+Math.floor(_rng()*80),
     dead:false, respawnTimer:0, hit:0, immuneTimer:0,
-    patrolX:(Math.random()-0.5)*10000, patrolY:(Math.random()-0.5)*10000, patrolTimer:0,
-    strafeDir:Math.sign(Math.random()-0.5),
-    strafeTimer:20+Math.floor(Math.random()*90),
+    patrolX:(_rng()-0.5)*10000, patrolY:(_rng()-0.5)*10000, patrolTimer:0,
+    strafeDir:Math.sign(_rng()-0.5),
+    strafeTimer:20+Math.floor(_rng()*90),
     disengageTimer:0,
     name:isT3?nextT3Name():(shipType===2?nextDroneName():nextName()),
     maxHp:hp,
     empTimer:0, speedBoost:0,
     rallyTarget:null, rallyTimer:0,
     kills:0, caps:0, dmgDealt:0,
-    beaconSeeker: Math.random()<0.25, // rôle attribué à la création
+    beaconSeeker: _rng()<0.25, // rôle attribué à la création
   };
 }
 const blues=[
@@ -1194,6 +1466,7 @@ function tickShield(obj){
   }
 }
 function takeHit(obj){
+  if(obj._testBot){ obj.hp=obj.maxHp; obj.hit=8; return true; } // bot cible invincible
   if(obj.immuneTimer>0) return true; // immunité spawn
   if(obj.shield>0){
     obj.shield--; obj.shieldHit=22; if(obj===ship) playSound('shield',0.35);
@@ -1276,6 +1549,7 @@ function calcKillScore(victim){
 
 // ── IA ────────────────────────────────────────────────────────────────────
 function updateAI(ai,enemies){
+  if(ai.dead&&ai.respawnTimer>=999999) return; // MAP TEST : bot supprimé
   if(ai.dead){
     if(ai.isMercenary){
       // Mercenaire : ne respawn que si la balise est tenue par son équipe
@@ -1284,7 +1558,7 @@ function updateAI(ai,enemies){
         const _eAngle=Math.random()*Math.PI*2;
         const _eR=MAP_RADIUS*0.85+Math.random()*500;
         ai.x=Math.cos(_eAngle)*_eR; ai.y=Math.sin(_eAngle)*_eR;
-        ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
+        ai.vx=ai.vy=ai.angVel=0; ai.angle=ai.team==='blue'?-Math.PI/2:Math.PI/2;
         ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
         ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
         ai.fireTimer=BURST_CD+Math.floor(Math.random()*80);
@@ -1305,7 +1579,7 @@ function updateAI(ai,enemies){
       if(teamLives[ai.team]<=0||teamLives[ai.team]<=aliveN) return;
       const sp=allSpawnPts[Math.floor(Math.random()*allSpawnPts.length)];
       ai.x=sp.x+(Math.random()-0.5)*120; ai.y=sp.y+(Math.random()-0.5)*120;
-      ai.vx=ai.vy=ai.angVel=0; ai.angle=Math.random()*Math.PI*2;
+      ai.vx=ai.vy=ai.angVel=0; ai.angle=ai.team==='blue'?-Math.PI/2:Math.PI/2;
       ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
       ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
       ai.formSlot=undefined;
@@ -1644,7 +1918,7 @@ function updateAI(ai,enemies){
         if(bullets.length<MAX_BULLETS){
           const _bspd=ai.shipType===2?TYPE2_BULLET_SPD:BULLET_SPEED;
           const _bhome=ai.shipType===2;
-          bullets.push({x:ai.x,y:ai.y,vx:Math.cos(ai.angle)*_bspd+ai.vx*0.25,vy:Math.sin(ai.angle)*_bspd+ai.vy*0.25,team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,shooter:ai,wx:ai.x,wy:ai.y,homing:_bhome});
+          bullets.push({x:ai.x,y:ai.y,vx:Math.cos(ai.angle)*_bspd+ai.vx*0.25,vy:Math.sin(ai.angle)*_bspd+ai.vy*0.25,team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,shooter:ai,wx:ai.x,wy:ai.y,homing:_bhome,zeroDmg:!!ai._testBot});
           sfxShoot(ai.x,ai.y);
         }
       }
@@ -1741,12 +2015,12 @@ function updateWorldSystems(){
   // ─ Zones EMP (timer visuel uniquement — coupure gérée dans la physique) ─
   for(const ez of EMP_ZONES) ez.t++;
   // ─ Pluie de météores ─
-  if(--meteorTimer<=0){
+  if(!_mpConnected&&--meteorTimer<=0){
     meteorTimer=1400+Math.floor(Math.random()*800);
     meteorDir*=-1;
     meteorWarn=180; meteorNotif=240;
   }
-  if(meteorWarn>0){
+  if(!_mpConnected&&meteorWarn>0){
     meteorWarn--;
     if(meteorWarn===120){ // lancer la pluie au milieu de l'avertissement
       // Direction aléatoire : angle d'entrée quelconque
@@ -2297,14 +2571,64 @@ function update(){
   for(const ai of blues){
     if(ai._netPid!==undefined){
       if(ai.dead){ mpNetRespawn(ai,'blue'); }
-      else updateNetPlayer(ai,_mpNetKeys.get('blue_'+ai._netSlot));
+      else {
+        const _isOwnShip=(_mpIsHost&&ai._netSlot===_mpMySlot&&ai._netTeam===_mpMyTeam);
+        if(_isOwnShip){
+          // Vaisseau propre de l'hôte : physique normale depuis les touches
+          updateNetPlayer(ai,_mpNetKeys.get('blue_'+ai._netSlot));
+        } else {
+          // Joueur distant : position + état autoritaires depuis _mpNetPos (modèle relay)
+          const _np=_mpNetPos.get('blue_'+ai._netSlot);
+          if(_np&&_np._fresh){
+            _np._fresh=false;
+            ai.x=_np.x; ai.y=_np.y;
+            ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
+            // CLIENT est autoritaire pour son propre hp/dead (modèle relay)
+            if(_np.hp!==undefined) ai.hp=_np.hp;
+            if(_np.shield!==undefined) ai.shield=_np.shield;
+            if(_np.dead!==undefined){
+              if(_np.dead&&!ai.dead){ ai.dead=true; ai.respawnTimer=_np.respawnTimer||RESPAWN_FRAMES; addExplosion(ai.x,ai.y,ai.team); teamLives[ai.team]--; mpLog(`HOST: mort reçue de ${ai.name||'?'} (${ai.team}) timer=${ai.respawnTimer}`); }
+              else if(!_np.dead&&ai.dead){ ai.dead=false; ai.respawnTimer=0; ai.immuneTimer=SPAWN_IMMUNE; mpLog(`HOST: respawn reçu de ${ai.name||'?'} (${ai.team})`); }
+            }
+            if(_np.immuneTimer!==undefined&&!_np.dead) ai.immuneTimer=_np.immuneTimer;
+          }
+          ai.x+=ai.vx; ai.y+=ai.vy;
+          ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
+          ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN;
+          updateNetPlayer(ai,null,true,true); // _noBullets=true : pas d'auto-tir côté host pour joueur distant
+        }
+      }
     } else updateAI(ai,reds);
     applyGravity(ai,false); wallBounce(ai);
   }
   for(const ai of reds){
     if(ai._netPid!==undefined){
       if(ai.dead){ mpNetRespawn(ai,'red'); }
-      else updateNetPlayer(ai,_mpNetKeys.get('red_'+ai._netSlot));
+      else {
+        const _isOwnShip=(_mpIsHost&&ai._netSlot===_mpMySlot&&ai._netTeam===_mpMyTeam);
+        if(_isOwnShip){
+          updateNetPlayer(ai,_mpNetKeys.get('red_'+ai._netSlot));
+        } else {
+          const _np=_mpNetPos.get('red_'+ai._netSlot);
+          if(_np&&_np._fresh){
+            _np._fresh=false;
+            ai.x=_np.x; ai.y=_np.y;
+            ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
+            // CLIENT est autoritaire pour son propre hp/dead (modèle relay)
+            if(_np.hp!==undefined) ai.hp=_np.hp;
+            if(_np.shield!==undefined) ai.shield=_np.shield;
+            if(_np.dead!==undefined){
+              if(_np.dead&&!ai.dead){ ai.dead=true; ai.respawnTimer=_np.respawnTimer||RESPAWN_FRAMES; addExplosion(ai.x,ai.y,ai.team); teamLives[ai.team]--; mpLog(`HOST: mort reçue de ${ai.name||'?'} (${ai.team}) timer=${ai.respawnTimer}`); }
+              else if(!_np.dead&&ai.dead){ ai.dead=false; ai.respawnTimer=0; ai.immuneTimer=SPAWN_IMMUNE; mpLog(`HOST: respawn reçu de ${ai.name||'?'} (${ai.team})`); }
+            }
+            if(_np.immuneTimer!==undefined&&!_np.dead) ai.immuneTimer=_np.immuneTimer;
+          }
+          ai.x+=ai.vx; ai.y+=ai.vy;
+          ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
+          ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN;
+          updateNetPlayer(ai,null,true,true); // _noBullets=true : pas d'auto-tir côté host pour joueur distant
+        }
+      }
     } else updateAI(ai,[...blues,ship]);
     applyGravity(ai,false); wallBounce(ai);
   }
@@ -2352,13 +2676,20 @@ function update(){
     let hit=false;
     for(const e of tgts){
       if(e.dead) continue;
+      // Modèle relay : chaque joueur est autoritaire pour ses propres dégâts
+      // HOST : skip les vaisseaux joueurs distants (ils gèrent eux-mêmes)
+      if(_mpConnected&&_mpIsHost&&e._netPid!==undefined&&!(e._netTeam===_mpMyTeam&&e._netSlot===_mpMySlot)) continue;
+      // CLIENT : ne vérifier que son propre vaisseau (les autres se gèrent eux-mêmes)
+      if(_mpConnected&&!_mpIsHost&&e!==_mpMyShip) continue;
       const _eHR=(e.radius||SHIP_RADIUS)*(b.owner==='player'?1.4:1.1); if(Math.hypot(b.x-e.x,b.y-e.y)<_eHR){
         addSpark(b.x,b.y,b.team);
+        if(b.zeroDmg){ hit=true; break; } // balle 0 dégâts du bot test
         const wasPlayer=b.owner==='player';
         if(!takeHit(e)){
           e.hp--; e.hit=10;
           if(e.hp<=0){
             e.dead=true;e.respawnTimer=RESPAWN_FRAMES;addExplosion(e.x,e.y,e.team);if(!e.isMercenary)teamLives[e.team]--;dropPickup(e.x,e.y);playSound('explode',0.55,e.x,e.y);
+            if(_mpConnected) mpLog(`DEATH ${e.name} tué par balle ${b.team}`);
             if(wasPlayer){ calcKillScore(e); _dmgDealt+=e.maxHp; }
             else if(b.shooter&&!b.shooter.isMercenary){ b.shooter.kills++; b.shooter.dmgDealt+=e.maxHp; }
             const sn=b.shooter?.name||'?';
@@ -2382,6 +2713,7 @@ function update(){
     // Bullets rouges vs joueur
     if(b.team==='red'&&!ship.dead&&Math.hypot(b.x-ship.x,b.y-ship.y)<(ship.radius||SHIP_RADIUS)*0.9){
       addSpark(b.x,b.y,'red');
+      if(b.zeroDmg){ bullets.splice(i,1); continue; } // balle 0 dégâts du bot test
       if(!takeHit(ship)){
         ship.hp--; ship.hit=10;
         if(ship.hp<=0){ship.dead=true;ship.respawnTimer=RESPAWN_FRAMES;addExplosion(ship.x,ship.y,'blue');teamLives.blue--;_playerLives--;dropPickup(ship.x,ship.y);playSound('explode',0.7);
@@ -2570,10 +2902,12 @@ function update(){
   const sB=spawns.filter(s=>s.team==='blue').length;
   const sR=spawns.filter(s=>s.team==='red').length;
   // Partie terminée seulement quand tous les survivants sont morts
-  const redAliveAny=reds.some(a=>!a.dead&&!a.isMercenary);
-  const blueAliveAny=blues.some(a=>!a.dead&&!a.isMercenary)||!ship.dead;
-  if(!redAliveAny) gameOver='blue';
-  if(!blueAliveAny) gameOver='red';
+  if(!_mpConnected){
+    const redAliveAny=reds.some(a=>!a.dead&&!a.isMercenary);
+    const blueAliveAny=blues.some(a=>!a.dead&&!a.isMercenary)||!ship.dead;
+    if(!redAliveAny) gameOver='blue';
+    if(!blueAliveAny) gameOver='red';
+  }
 }
 
 // ── Rendu ─────────────────────────────────────────────────────────────────
@@ -3114,6 +3448,7 @@ function drawStars(){
 }
 
 function drawSpawns(){
+  if(_mpConnected) return; // Stations = mode solo uniquement
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const sp of spawns){
     const sx=sp.x-_camX+cx, sy=sp.y-_camY+cy;
@@ -3336,8 +3671,11 @@ function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
     const sx=ai.x-_camX+cx, sy=ai.y-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
     const aiR=ai.radius||SHIP_RADIUS;
+    // Fade-in au spawn : de transparent (immuneTimer=SPAWN_IMMUNE) à opaque (en 60 frames)
+    const _spA=ai.immuneTimer>0?Math.min(1,(SPAWN_IMMUNE-ai.immuneTimer)/60):1;
+    if(_spA<0.03) continue; // encore trop transparent
+    if(_spA<1) ctx.globalAlpha=_spA;
     drawShield(sx,sy,aiR,ai,rgb);
-    if(ai.immuneTimer>0&&Math.floor(ai.immuneTimer/5)%2===0) continue;
     ctx.save(); ctx.translate(sx,sy); ctx.rotate(ai.angle);
     // Couleur uniforme par équipe (palette mercenaire si applicable)
     const _fc=ai.isMercenary?(ai.team==='blue'?'#091830':'#380a08'):fillColT1;
@@ -3405,6 +3743,7 @@ function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
       ctx.fillText('['+ai.name+']',sx,sy+aiR*2.1+18);
       ctx.textAlign='left';
     }
+    if(_spA<1) ctx.globalAlpha=1; // reset alpha après chaque vaisseau
   }
 }
 
@@ -3433,7 +3772,9 @@ function drawFormationLinks(){
 
 function drawPlayerShip(){
   if(ship.dead) return;
-  if(ship.immuneTimer>0&&Math.floor(ship.immuneTimer/5)%2===0) return;
+  const _spAP=ship.immuneTimer>0?Math.min(1,(SPAWN_IMMUNE-ship.immuneTimer)/60):1;
+  if(_spAP<0.03) return;
+  if(_spAP<1) ctx.globalAlpha=_spAP;
   const cx=canvas.width/2, cy=canvas.height/2;
   const psx=spectMode?ship.x-_camX+cx:cx;
   const psy=spectMode?ship.y-_camY+cy:cy;
@@ -3486,6 +3827,7 @@ function drawPlayerShip(){
     ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.fillRect(cx-_bw/2,cy+(_pType===3?36:22),_bw,4);
     ctx.fillStyle='#4adf80'; ctx.fillRect(cx-_bw/2,cy+(_pType===3?36:22),_bw*(ship.hp/_maxHp),4);
   }
+  if(_spAP<1) ctx.globalAlpha=1; // reset
 }
 
 // ── Flèches radar ─────────────────────────────────────────────────────────
@@ -3825,6 +4167,67 @@ function drawHUD(){
   }
 }
 
+function drawMpCoords(){
+  if(!_mpConnected) return;
+  const W=canvas.width, H=canvas.height;
+  ctx.save();
+  ctx.font='bold 13px monospace';
+  ctx.textAlign='left';
+  ctx.shadowColor='#000'; ctx.shadowBlur=4;
+  let row=0;
+  // Collect all player ships
+  const allShips=[];
+  for(const b of blues){
+    if(b._netPid!==undefined){
+      allShips.push({ship:b,team:'blue',name:b.name||('blue'+b._netSlot),isMe:b===_mpMyShip});
+    }
+  }
+  for(const r of reds){
+    if(r._netPid!==undefined){
+      allShips.push({ship:r,team:'red',name:r.name||('red'+r._netSlot),isMe:r===_mpMyShip});
+    }
+  }
+  // Header
+  const _dbgExtra=_mpIsHost
+    ? `  rx:${_mpDbgRx||0}`
+    : `  tx:${_mpDbgTx||0}  ship:${_mpMyShip?'OK':'NULL'}`;
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.fillRect(8, 8, 340, 22+(allShips.length+1)*20);
+  ctx.fillStyle='#fff';
+  ctx.fillText('─── MP COORDS '+((_mpIsHost)?'[HOST]':'[CLIENT]')+' ───', 14, 24);
+  row++;
+  ctx.fillStyle='#ff0';
+  ctx.fillText(_dbgExtra, 14, 24+row*20);
+  row++;
+  for(const {ship,team,name,isMe} of allShips){
+    const col=team==='blue'?'#6af':'#f76';
+    ctx.fillStyle=col;
+    const status=ship.dead?'☠':'●';
+    const label=`${status} ${name}${isMe?' ◄':''}`;
+    const coords=ship.dead?'(mort)':` x:${Math.round(ship.x)}  y:${Math.round(ship.y)}`;
+    ctx.fillText(label+coords, 14, 24+row*20);
+    row++;
+  }
+  // Journal des événements MP
+  if(_mpLog.length>0){
+    const lx=8, ly=30+(allShips.length+2)*20+8;
+    ctx.fillStyle='rgba(0,0,0,0.55)';
+    ctx.fillRect(lx, ly, 400, 16+_mpLog.length*16);
+    ctx.font='11px monospace'; ctx.fillStyle='#aaf';
+    ctx.fillText('─── MP LOG ───', lx+6, ly+13);
+    for(let i=0;i<_mpLog.length;i++){
+      const age=i/(_mpLog.length||1);
+      ctx.globalAlpha=1-age*0.65;
+      ctx.fillStyle=_mpLog[i].includes('DEATH')||_mpLog[i].includes('mort')||_mpLog[i].includes('dead')?'#f88':
+                    _mpLog[i].includes('RESPAWN')||_mpLog[i].includes('respawn')?'#8f8':'#aaa';
+      ctx.fillText(_mpLog[i].slice(0,60), lx+6, ly+14+( i+1)*16);
+    }
+    ctx.globalAlpha=1;
+  }
+  ctx.shadowBlur=0;
+  ctx.restore();
+}
+
 function drawGameOver(){
   const W=canvas.width, H=canvas.height;
   ctx.fillStyle='rgba(0,0,0,0.75)'; ctx.fillRect(0,0,W,H);
@@ -4063,10 +4466,13 @@ const ZOOM_WORLD = isMobile ? 0.62 : 1.0;
 // Sur mobile (zoom 0.62) la vue est ~60% plus large en coords canvas non-zoomees
 const CULL_MG = Math.ceil(Math.max(canvas.width, canvas.height) / ZOOM_WORLD * 0.55) + 120;
 function updateCamera(){
-  // Auto-entree spectateur a la mort
-  if(!spectMode&&ship.dead){ spectMode=true; spectIdx=0; spectAutoDeath=true; }
-  // Auto-sortie au respawn (seulement si entre automatiquement)
-  if(spectMode&&!ship.dead&&spectAutoDeath){ spectMode=false; spectAutoDeath=false; }
+  // Auto-entree spectateur a la mort (solo uniquement — en MP le spectateur est inutile)
+  if(!_mpConnected){
+    if(!spectMode&&ship.dead){ spectMode=true; spectIdx=0; spectAutoDeath=true; }
+    if(spectMode&&!ship.dead&&spectAutoDeath){ spectMode=false; spectAutoDeath=false; }
+  } else {
+    spectMode=false; _spectTarget=null; // jamais de mode spectateur en MP
+  }
   if(spectMode){
     const pool=[...blues,...reds].filter(a=>!a.dead);
     if(pool.length){
@@ -4075,7 +4481,14 @@ function updateCamera(){
     } else { _spectTarget=null; spectMode=false; }
   } else { _spectTarget=null; }
   if(_mpMyShip&&_mpConnected){
-    _camX=_mpMyShip.x; _camY=_mpMyShip.y;
+    // Client non-host : caméra sur position host-reportée (même référentiel que les balles)
+    // avec lerp doux pour éviter les sauts entre les paquets
+    if(!_mpIsHost&&_mpHostReportedX!==null){
+      _camX+=(_mpHostReportedX-_camX)*0.6;
+      _camY+=(_mpHostReportedY-_camY)*0.6;
+    } else {
+      _camX=_mpMyShip.x; _camY=_mpMyShip.y;
+    }
   } else {
     _camX=_spectTarget?_spectTarget.x:ship.x;
     _camY=_spectTarget?_spectTarget.y:ship.y;
@@ -4359,16 +4772,54 @@ function loop(){
         // Non-host : appliquer l'état reçu du host
         _gameTick++;  // avancer le compteur même sans update() pour les animations
         if(_mpPending){ mpApplyState(_mpPending); _mpPending=null; }
-        // Extrapolation locale → fluidité 60fps pour rochers
-        for(const a of ASTEROIDS){ a.wx+=a.vx; a.wy+=a.vy; a.rot+=a.rotVel; }
-        for(const m of meteors){ m.x+=m.vx; m.y+=m.vy; if(m.rot!==undefined) m.rot+=m.rotVel; }
-        // Nettoyage minimal non-hôte : bullets + particles expirent correctement
+        // Nettoyage minimal non-hôte : bullets + particles + bannières expirent correctement
         for(let _bi=bullets.length-1;_bi>=0;_bi--){ bullets[_bi].x+=bullets[_bi].vx; bullets[_bi].y+=bullets[_bi].vy; if(--bullets[_bi].life<=0) bullets.splice(_bi,1); }
         for(let _pi=particles.length-1;_pi>=0;_pi--){ if(--particles[_pi].life<=0) particles.splice(_pi,1); }
-        // Prédiction locale du propre vaisseau (évite lag d'input)
-        if(_mpMyShip&&!_mpMyShip.dead&&_mpMySlot!==null){
-          updateNetPlayer(_mpMyShip,{left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
+        if(_rallyNotif){_rallyNotif.life--;if(_rallyNotif.life<=0)_rallyNotif=null;}
+        // Dead reckoning : avancer tous les vaisseaux avec leur vitesse pour lisser entre syncs
+        for(const _s of blues){
+          if(_s.dead) continue;
+          if(_s!==_mpMyShip){ _s.x+=_s.vx; _s.y+=_s.vy; if(_s.angVel){_s.angle+=_s.angVel;_s.angVel*=0.88;} }
+          if(_s.hit>0) _s.hit--;
+          if(_s!==_mpMyShip&&_s.immuneTimer>0) _s.immuneTimer--;
         }
+        for(const _s of reds){
+          if(_s.dead) continue;
+          if(_s!==_mpMyShip){ _s.x+=_s.vx; _s.y+=_s.vy; if(_s.angVel){_s.angle+=_s.angVel;_s.angVel*=0.88;} }
+          if(_s.hit>0) _s.hit--;
+          if(_s!==_mpMyShip&&_s.immuneTimer>0) _s.immuneTimer--;
+        }
+        // Rotation locale des tourelles (tracking visuel sans tir — corrigé par l'état hôte)
+        for(const sp of spawns){
+          if(sp.team==='neutral') continue;
+          const _tfoes=sp.team==='blue'?[...reds]:[...blues];
+          for(const tr of sp.turrets){
+            if(tr.hp<=0) continue;
+            const _ttx=sp.x+Math.cos(tr.offsetAngle)*(tr.offsetRadius||0);
+            const _tty=sp.y+Math.sin(tr.offsetAngle)*(tr.offsetRadius||0);
+            let _tn=null,_tnd=680;
+            for(const f of _tfoes){ if(f.dead) continue; const _td=Math.hypot(f.x-_ttx,f.y-_tty); if(_td<_tnd){_tnd=_td;_tn=f;} }
+            if(_tn){ let _tda=Math.atan2(_tn.y-_tty,_tn.x-_ttx)-tr.angle; while(_tda>Math.PI)_tda-=Math.PI*2; while(_tda<-Math.PI)_tda+=Math.PI*2; tr.angle+=Math.sign(_tda)*Math.min(Math.abs(_tda),0.055); }
+          }
+        }
+        // Prédiction locale du propre vaisseau (tir + physique côté client)
+        try{
+        if(_mpMyShip&&!_mpMyShip.dead&&_mpMySlot!==null){
+          const _bBefore=bullets.length;
+          updateNetPlayer(_mpMyShip,{left:!!keys.left,right:!!keys.right},false); // tir activé côté CLIENT
+          // Balles nouvelles créées par le CLIENT → relayées à l'hôte + conservées localement
+          const _newBuls=bullets.slice(_bBefore);
+          _mpClientNewBullets=_newBuls.map(b=>[
+            Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2)]);
+          applyGravity(_mpMyShip,false);
+          wallBounce(_mpMyShip);
+        } else if(_mpMyShip&&_mpMyShip.dead){
+          // Décompte + respawn local (CLIENT est autoritaire — même logique que l'hôte)
+          if((_mpMyShip.respawnTimer||0)<=1) mpLog(`CLIENT: mpNetRespawn appel timer=${_mpMyShip.respawnTimer||0}`);
+          mpNetRespawn(_mpMyShip,_mpMyTeam);
+          _mpClientNewBullets=[];
+        } else { _mpClientNewBullets=[]; }
+        }catch(_ce){ console.error('[MP] Erreur client loop:',_ce); if(_mpConnected) mpLog(`❌ ${_ce.message||_ce}`); _mpClientNewBullets=[]; }
         mpSendInput();
       }
     } else {
@@ -4424,6 +4875,7 @@ function loop(){
   {const nebInside=NEBULAE.find(n=>Math.hypot(_camX-n.x,_camY-n.y)<n.r);
   if(nebInside){ctx.fillStyle=`rgba(${nebInside.c[0]},${nebInside.c[1]},${nebInside.c[2]},0.13)`;ctx.fillRect(0,0,canvas.width,canvas.height);}}
   drawHUD();
+  drawMpCoords();
   if(_deathFxTimer>0){
     const t=_deathFxTimer/75;
     ctx.fillStyle=`rgba(180,0,0,${t*t*0.55})`;
