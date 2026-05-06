@@ -732,13 +732,10 @@ function mpSendInput(){
     _mis.x=0; _mis.y=0; _mis.vx=0; _mis.vy=0;
   }
   _mpDbgTx=((_mpDbgTx||0)+1);
-  const _sentX=_mis?+_mis.x.toFixed(1):undefined;
-  const _sentY=_mis?+_mis.y.toFixed(1):undefined;
-  window._mpLastSentX=_sentX; // debug: dernier x envoyé
   _mpWs.send(JSON.stringify({type:'input',t:_now,
     keys:{left:!!keys.left,right:!!keys.right},
-    x:_sentX,
-    y:_sentY,
+    x:_mis?+_mis.x.toFixed(1):undefined,
+    y:_mis?+_mis.y.toFixed(1):undefined,
     vx:_mis?+_mis.vx.toFixed(3):undefined,
     vy:_mis?+_mis.vy.toFixed(3):undefined,
     angle:_mis?+_mis.angle.toFixed(4):undefined,
@@ -4482,7 +4479,6 @@ function drawHUD(){
       'TX:'+_mpDbgTx+' wsState:'+(_mpWs?_mpWs.readyState:'null'),
       'isHost:'+_mpIsHost+' connected:'+_mpConnected,
       'ship==b[slot]:'+((_mpMyShip===(_mpMyTeam==='blue'?blues:reds)[_mpMySlot])?'YES':'NO')+' xTyp:'+(typeof _ms.x),
-      'sentX:'+(window._mpLastSentX===undefined?'UNDEF':window._mpLastSentX),
     ];
     const _dh=_dl.length*14+8;
     ctx.fillStyle='rgba(0,0,0,0.75)';
