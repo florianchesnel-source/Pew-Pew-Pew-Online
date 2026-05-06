@@ -1,8 +1,16 @@
 // PewPewPew – Serveur WebSocket multijoueur
 // npm install ws  puis  node server.js
 const WebSocket = require('ws');
+const http = require('http');
 const PORT = process.env.PORT || 8080;
-const wss  = new WebSocket.Server({ port: PORT });
+
+// Serveur HTTP pour le health check Railway + upgrade WebSocket
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('PewPewPew OK');
+});
+const wss = new WebSocket.Server({ server });
+server.listen(PORT);
 
 // Une seule room pour l'instant
 const room = {
@@ -48,16 +56,41 @@ wss.on('connection', ws => {
       }
 
       case 'input':
-        // Non-host → host : relayer l'input
-        if (room.hostWs && room.hostWs !== ws && room.hostWs.readyState === 1)
-          _send(room.hostWs, {type:'input',pid:pd.pid,team:pd.team,slot:pd.slot,keys:msg.keys});
+        // Mémoriser le RTT du client pour choisir le meilleur host
+        if (msg.rtt !== undefined) pd.rtt = msg.rtt;
+        // DEBUG: log every 120th message to check x
+        pd._dbgCount = (pd._dbgCount || 0) + 1;
+        if (pd._dbgCount % 120 === 0) {
+          console.log(`[INPUT] ${pd.name} slot=${pd.slot} x=${msg.x} hasX=${msg.x !== undefined} isHost=${ws === room.hostWs}`);
+        }
+        // Non-host → host : relayer l'input complet
+        if (room.hostWs && room.hostWs !== ws && room.hostWs.readyState === 1) {
+          const relayed = Object.assign({}, msg, {
+            type:'input', pid:pd.pid, team:pd.team, slot:pd.slot
+          });
+          _send(room.hostWs, relayed);
+        }
         break;
 
       case 'state':
       case 'event':
+      case 'restart':
         // Host → tout le monde
         if (ws === room.hostWs) _broadcast(ws, msg);
         break;
+
+      case 'resign_host': {
+        // L'host cède volontairement son rôle (ex: onglet en arrière-plan)
+        if (ws !== room.hostWs) break;
+        console.log(`[H] ${pd.name} cède le rôle d'host`);
+        pd.isHost = false;
+        room.hostWs = null;
+        // Promouvoir le client avec le meilleur RTT
+        _promoteHost(ws);
+        // Notifier l'ancien host qu'il est maintenant client
+        _send(ws, { type: 'demoted_client' });
+        break;
+      }
     }
   });
 
@@ -67,27 +100,48 @@ wss.on('connection', ws => {
       room.free[pd.team].push(pd.slot);
       _broadcast(ws, {type:'player_left',pid:pd.pid,team:pd.team,slot:pd.slot});
       console.log(`[-] ${pd.name} déconnecté`);
-      // Si le host part → promouvoir un autre joueur
+      // Si le host part → promouvoir le client avec le meilleur RTT
       if (ws === room.hostWs) {
         room.hostWs = null;
-        for (const [cws,cp] of room.clients) {
-          if (cws !== ws && cws.readyState === 1 && cp.team) {
-            room.hostWs = cws; cp.isHost = true;
-            _send(cws, {type:'promoted_host'});
-            console.log(`[H] Nouveau host : ${cp.name}`);
-            break;
-          }
-        }
+        _promoteHost(ws);
       }
     }
     room.clients.delete(ws);
   });
 });
 
+// Promouvoir le client avec le meilleur RTT (hors ws exclu)
+function _promoteHost(excludeWs) {
+  let bestWs = null, bestRtt = Infinity;
+  for (const [cws, cp] of room.clients) {
+    if (cws === excludeWs || cws.readyState !== 1 || !cp.team) continue;
+    const rtt = cp.rtt !== undefined ? cp.rtt : 9999;
+    if (rtt < bestRtt) { bestRtt = rtt; bestWs = cws; }
+  }
+  if (bestWs) {
+    const cp = room.clients.get(bestWs);
+    room.hostWs = bestWs; cp.isHost = true;
+    _send(bestWs, { type: 'promoted_host' });
+    console.log(`[H] Nouveau host : ${cp.name} (rtt=${bestRtt}ms)`);
+  }
+}
+
 function _send(ws, obj)      { if (ws.readyState===1) ws.send(JSON.stringify(obj)); }
 function _broadcast(exc,obj) {
   const s = JSON.stringify(obj);
   for (const [ws] of room.clients) if (ws!==exc && ws.readyState===1) ws.send(s);
 }
+
+// Keepalive : ping toutes les 30s pour éviter le timeout Railway
+const PING_INTERVAL = 30_000;
+setInterval(() => {
+  for (const [ws] of room.clients) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.ping();
+    } else {
+      room.clients.delete(ws);
+    }
+  }
+}, PING_INTERVAL);
 
 console.log(`PewPewPew server → port ${PORT}`);
