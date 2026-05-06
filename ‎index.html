@@ -488,18 +488,9 @@ function mpApplyState(s){
       // Premier état : snap immédiat sur la position HOST
       if(_mpFirstState){
         obj.x=d.x; obj.y=d.y; obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
-      } else if(!obj.dead){
-        // Correction vers position HOST extrapolée (position HOST + vitesse × LAG)
-        // → compense le retard réseau, évite de tirer le vaisseau en arrière
-        const _exX=d.x+(d.vx||0)*_mpLAG, _exY=d.y+(d.vy||0)*_mpLAG;
-        const _pdx=_exX-obj.x, _pdy=_exY-obj.y;
-        const _pdist=Math.hypot(_pdx,_pdy);
-        // Correction seulement si grand écart (>60px) — désync réel, pas lag normal
-        if(_pdist>60){
-          const _pf=Math.min(8,_pdist*0.08)/_pdist;
-          obj.x+=_pdx*_pf; obj.y+=_pdy*_pf;
-        }
       }
+      // CLIENT autoritaire pour sa propre position (pas de correction HOST)
+      // Le HOST utilise deja la position CLIENT comme reference authoritative
       // Mémoriser la position reportée par l'hôte
       _mpHostReportedX=d.x; _mpHostReportedY=d.y;
       // Modèle relay : CLIENT est autoritaire pour sa propre mort/respawn
@@ -731,17 +722,23 @@ let _mpLastInput=0, _mpClientNewBullets=[], _mpLocalBullets=[];
 function mpSendInput(){
   if(_mpIsHost||!_mpWs||_mpWs.readyState!==1) return;
   const _now=Date.now(); if(_now-_mpLastInput<16) return; _mpLastInput=_now; // ~60fps
-  const _mis=_mpMyShip;
+  // Fallback : si _mpMyShip est null, chercher directement dans le tableau
+  const _fleet=_mpMyTeam==='blue'?blues:reds;
+  const _mis=_mpMyShip||(_fleet&&_mpMySlot!==null?_fleet[_mpMySlot]:null);
+  if(!_mis){ mpLog('⚠ mpSendInput: _mpMyShip null slot='+_mpMySlot+' team='+_mpMyTeam); }
   // Garde NaN : si la position du vaisseau est corrompue, on loggue et on passe
   if(_mis&&(isNaN(_mis.x)||isNaN(_mis.y))){
     mpLog(`⚠ NaN détecté ship pos → reset x=${_mis.x} y=${_mis.y}`);
     _mis.x=0; _mis.y=0; _mis.vx=0; _mis.vy=0;
   }
   _mpDbgTx=((_mpDbgTx||0)+1);
+  const _sentX=_mis?+_mis.x.toFixed(1):undefined;
+  const _sentY=_mis?+_mis.y.toFixed(1):undefined;
+  window._mpLastSentX=_sentX; // debug: dernier x envoyé
   _mpWs.send(JSON.stringify({type:'input',t:_now,
     keys:{left:!!keys.left,right:!!keys.right},
-    x:_mis?+_mis.x.toFixed(1):undefined,
-    y:_mis?+_mis.y.toFixed(1):undefined,
+    x:_sentX,
+    y:_sentY,
     vx:_mis?+_mis.vx.toFixed(3):undefined,
     vy:_mis?+_mis.vy.toFixed(3):undefined,
     angle:_mis?+_mis.angle.toFixed(4):undefined,
@@ -2777,20 +2774,17 @@ function update(){
           // Vaisseau propre de l'hôte : physique normale depuis les touches
           updateNetPlayer(ai,_mpNetKeys.get('blue_'+ai._netSlot));
         } else {
-          // Joueur distant : position + état autoritaires depuis _mpNetPos (modèle relay)
+          // Joueur distant : position CLIENT autoritaire
           const _np=_mpNetPos.get('blue_'+ai._netSlot);
           if(_np&&_np._fresh){
             _np._fresh=false;
             ai.x=_np.x; ai.y=_np.y;
             ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
-            // HOST est autoritaire pour les HP (dégâts via collision HOST)
-            // Ne pas écraser ai.hp depuis le client → bullets HOST font des dégâts réels
-
           }
           ai.x+=ai.vx; ai.y+=ai.vy;
           ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
           ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN;
-          updateNetPlayer(ai,null,true,true); // _noBullets=true : pas d'auto-tir côté host pour joueur distant
+          updateNetPlayer(ai,null,true,true);
         }
       }
     } else updateAI(ai,reds);
@@ -2809,14 +2803,11 @@ function update(){
             _np._fresh=false;
             ai.x=_np.x; ai.y=_np.y;
             ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
-            // HOST est autoritaire pour les HP (dégâts via collision HOST)
-            // Ne pas écraser ai.hp depuis le client → bullets HOST font des dégâts réels
-
           }
           ai.x+=ai.vx; ai.y+=ai.vy;
           ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
           ai.vx*=DAMPING_LIN; ai.vy*=DAMPING_LIN;
-          updateNetPlayer(ai,null,true,true); // _noBullets=true : pas d'auto-tir côté host pour joueur distant
+          updateNetPlayer(ai,null,true,true);
         }
       }
     } else updateAI(ai,_mpConnected?blues:[...blues,ship]);
@@ -4461,6 +4452,45 @@ function drawHUD(){
     ctx.fillText(_ping+'ms',_pX+_pW*0.72,_pY+_pH*0.78);
     ctx.shadowBlur=0; ctx.textAlign='left';
   }
+  // DEBUG HUD HOST
+  if(_mpConnected&&_mpIsHost&&_gameStarted){
+    ctx.save();
+    ctx.font='10px monospace'; ctx.textAlign='left';
+    const _hdl=['HOST DEBUG rx:'+_mpDbgRx+' keys:'+_mpNetKeys.size];
+    _mpNetKeys.forEach(function(v,k){ _hdl.push('KEY '+k+' L:'+(v.left?1:0)+' R:'+(v.right?1:0)); });
+    _mpNetPos.forEach(function(np,k){
+      _hdl.push(k+' x:'+np.x.toFixed(0)+' vx:'+np.vx.toFixed(2)+' fr:'+(np._fresh?1:0));
+    });
+    const _hh=_hdl.length*14+8;
+    ctx.fillStyle='rgba(0,0,0,0.75)';
+    ctx.fillRect(8,canvas.height-_hh-8,240,_hh);
+    ctx.fillStyle='#ffcc00';
+    _hdl.forEach(function(l,i){ctx.fillText(l,14,canvas.height-_hh+8+i*14);});
+    ctx.restore();
+  }
+  // DEBUG HUD client
+  if(_mpConnected&&!_mpIsHost&&_mpMyShip&&_gameStarted){
+    const _ms=_mpMyShip;
+    ctx.save();
+    ctx.font='10px monospace'; ctx.textAlign='left';
+    const _dl=[
+      'POS x:'+_ms.x.toFixed(0)+' y:'+_ms.y.toFixed(0),
+      'VEL vx:'+_ms.vx.toFixed(3)+' vy:'+_ms.vy.toFixed(3),
+      'KEYS L:'+(keys.left?1:0)+' R:'+(keys.right?1:0)+' dead:'+(_ms.dead?1:0),
+      'SLOT:'+_mpMySlot+'/'+_mpMyTeam+' LAG:'+_mpLAG,
+      'HostX:'+(_mpHostReportedX||0).toFixed(0)+' HostY:'+(_mpHostReportedY||0).toFixed(0),
+      'TX:'+_mpDbgTx+' wsState:'+(_mpWs?_mpWs.readyState:'null'),
+      'isHost:'+_mpIsHost+' connected:'+_mpConnected,
+      'ship==b[slot]:'+((_mpMyShip===(_mpMyTeam==='blue'?blues:reds)[_mpMySlot])?'YES':'NO')+' xTyp:'+(typeof _ms.x),
+      'sentX:'+(window._mpLastSentX===undefined?'UNDEF':window._mpLastSentX),
+    ];
+    const _dh=_dl.length*14+8;
+    ctx.fillStyle='rgba(0,0,0,0.75)';
+    ctx.fillRect(8,canvas.height-_dh-8,215,_dh);
+    ctx.fillStyle='#00ff88';
+    _dl.forEach(function(l,i){ctx.fillText(l,14,canvas.height-_dh+8+i*14);});
+    ctx.restore();
+  }
 }
 
 
@@ -5246,11 +5276,33 @@ function _drawDisconnectOverlay(){
 }
 
 // Migration d'host : resign quand onglet cache
+let _bgLoopIv=null;
+function _mpClientBgTick(){
+  if(!_mpConnected||_mpIsHost||!_gameStarted){clearInterval(_bgLoopIv);_bgLoopIv=null;return;}
+  _gameTick++;
+  if(_mpPending){try{mpApplyState(_mpPending);}catch(_e){}; _mpPending=null;}
+  try{
+    if(_mpMyShip&&!_mpMyShip.dead&&_mpMySlot!==null){
+      updateNetPlayer(_mpMyShip,{left:!!keys.left,right:!!keys.right},false);
+      applyGravity(_mpMyShip,false);
+      wallBounce(_mpMyShip);
+    }
+  }catch(_e){}
+  mpSendInput();
+}
 document.addEventListener('visibilitychange',()=>{
-  if(!_mpIsHost||!_mpConnected||!_mpWs||_mpWs.readyState!==1) return;
+  if(!_mpConnected||!_mpWs||_mpWs.readyState!==1) return;
   if(document.hidden){
-    _mpWs.send(JSON.stringify({type:'resign_host'}));
-    mpLog("Onglet cache - transfert hote en cours...");
+    if(_mpIsHost){
+      _mpWs.send(JSON.stringify({type:'resign_host'}));
+      mpLog("Onglet caché - transfert hôte en cours...");
+    } else if(_gameStarted&&!_bgLoopIv){
+      // Onglet client en arrière-plan : setInterval pour continuer la physique
+      _bgLoopIv=setInterval(_mpClientBgTick,1000/60);
+    }
+  } else {
+    // Retour au premier plan : rAF reprend, on arrête le setInterval
+    if(_bgLoopIv){clearInterval(_bgLoopIv);_bgLoopIv=null;}
   }
 });
 
