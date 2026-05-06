@@ -137,6 +137,13 @@
     <div class="smenu-sep"></div>
     <button id="mp-toggle" onclick="mpTogglePanel()">🌐 &nbsp;Mode Multijoueur</button>
     <div id="mp-panel">
+      <div style="margin:0 0 7px;display:flex;gap:5px;align-items:center">
+        <span style="font:9px monospace;color:#5a8fc8;white-space:nowrap">SERVEUR</span>
+        <input id="mp-url" type="text" value="wss://pew-pew-pew-online-production.up.railway.app"
+          style="flex:1;background:rgba(5,15,50,0.8);border:1px solid #2a4a8a;border-radius:4px;
+          color:#9ac8ff;font:10px monospace;padding:4px 6px;outline:none"
+          spellcheck="false" autocomplete="off">
+      </div>
       <div class="mp-teams">
         <button class="mp-btn-blue" onclick="mpJoin('blue')">▶ Équipe Bleue</button>
         <button class="mp-btn-red"  onclick="mpJoin('red')">▶ Équipe Rouge</button>
@@ -161,24 +168,81 @@ canvas.height = window.innerHeight;
 // ── Audio (Web Audio API) ─────────────────────────────────────────────────
 const _ac=(()=>{try{return new(window.AudioContext||window.webkitAudioContext)();}catch(e){return null;}})();
 
+// ── Hitscan : balles cosmétiques + dégâts différés synchronisés ─────────
+const _pendingHits=[];
+
+function fireBulletHitscan(ai,vx,vy,speed,homing,zeroDmg){
+  const tgt=ai.burstTarget&&!ai.burstTarget.dead?ai.burstTarget:null;
+  // Durée de vol = distance / vitesse (ou BULLET_LIFE si pas de cible)
+  const _dist=tgt?Math.hypot(tgt.x-ai.x,tgt.y-ai.y):FIRE_RANGE;
+  const _fly=tgt?Math.max(4,Math.round(_dist/speed*(homing?1.25:1))):BULLET_LIFE;
+  // Ajuster la vitesse du missile cosmétique pour qu'il arrive exactement au bon moment
+  let _bvx=vx,_bvy=vy;
+  if(tgt&&_fly>0){
+    const _actualSpd=Math.hypot(vx,vy);
+    if(_actualSpd>0){
+      const _targetSpd=_dist/_fly;
+      const _sAdj=_targetSpd/_actualSpd;
+      _bvx=vx*_sAdj; _bvy=vy*_sAdj;
+    }
+  }
+  // Missile cosmétique : même apparence, mais collision désactivée
+  const _bLife=tgt?_fly+2:BULLET_LIFE; // +2 pour voir l'explosion avant disparition
+  if(bullets.length<MAX_BULLETS){
+    bullets.push({x:ai.x,y:ai.y,vx:_bvx,vy:_bvy,team:ai.team,
+      life:_bLife,_maxLife:_bLife,
+      target:tgt,shooter:ai,homing,zeroDmg:!!zeroDmg,cosmetic:true});
+  }
+  sfxShoot(ai.x,ai.y);
+  // PendingHit : dégâts appliqués exactement quand le missile arrive
+  if(tgt&&!zeroDmg){
+    _pendingHits.push({target:tgt,shooter:ai,framesLeft:_fly,homing});
+  }
+}
+
+function processPendingHits(){
+  for(let _i=_pendingHits.length-1;_i>=0;_i--){
+    const _ph=_pendingHits[_i];
+    // Pour les guidés : recalculer la cible si elle a bougé de la trajectoire
+    if(--_ph.framesLeft>0) continue;
+    const _t=_ph.target;
+    if(!_t||_t.dead){_pendingHits.splice(_i,1);continue;}
+    // Appliquer les dégâts
+    if(_t._hitImmune>0){_pendingHits.splice(_i,1);continue;}
+    if(!takeHit(_t)){
+      _t.hp--; _t.hit=10; _t._hitImmune=5;
+      addSpark(_t.x,_t.y,_ph.shooter?.team||'blue');
+      if(_t.hp<=0){
+        _t.dead=true; _t.respawnTimer=RESPAWN_FRAMES;
+        addExplosion(_t.x,_t.y,_t.team);
+        if(!_t.isMercenary) teamLives[_t.team]--;
+        dropPickup(_t.x,_t.y); playSound('explode',0.55,_t.x,_t.y);
+        if(_mpConnected) mpLog(`DEATH ${_t.name} tué par ${_ph.shooter?.name||'?'}`);
+        addLog([{text:_ph.shooter?.name||'?',col:teamCol(_ph.shooter?.team)},{text:' ✕ ',col:'#888'},{text:_t.name,col:teamCol(_t.team)}]);
+      }
+    } else {
+      // Bouclier absorbé : effet visuel uniquement
+      addSpark(_t.x,_t.y,_ph.shooter?.team||'blue');
+    }
+    _pendingHits.splice(_i,1);
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  MULTIJOUEUR
 // ══════════════════════════════════════════════════════════════════
 let _mpWs=null, _mpConnected=false, _mpIsHost=false;
+let _mpDisconnected=false; // true = connexion perdue en cours de partie
+let _mpReconnectTimer=0, _mpReconnectAttempts=0;
+let _mpSavedParams=null; // {url,team,name} pour reconnexion auto
 let _mpMyPid=null, _mpMySlot=null, _mpMyTeam=null, _mpMyShip=null;
 let _mpPlayers=new Map();       // pid → {team,slot,name}
 let _mpNetKeys=new Map();       // 'blue_N' | 'red_N' → {left,right}
 let _mpNetPos=new Map();        // 'blue_N' | 'red_N' → {x,y,vx,vy,angle} position autoritaire du client
 let _mpDbgRx=0, _mpDbgTx=0;   // debug counters
-const _mpLog=[];               // journal MP debug (max 12 entrées)
+let _mpLastClientT=0, _mpRTT=50, _mpLAG=2; // mesure latence
 let _mpLogT0=Date.now();
-function mpLog(msg){
-  const t=((Date.now()-_mpLogT0)/1000).toFixed(1);
-  const role=(_mpIsHost?'H':'C');
-  _mpLog.unshift(`[${t}s][${role}] ${msg}`);
-  if(_mpLog.length>12) _mpLog.length=12;
-  console.log(`[MP][${role}] ${msg}`);
-}
+function mpLog(){}
 let _mpHostReportedX=null, _mpHostReportedY=null; // dernière position du client vue par l'host
 let _mpLastSent=0;              // ts dernier state envoyé (host)
 let _mpPending=null;
@@ -195,20 +259,20 @@ function mpStatus(txt){ const el=document.getElementById('mp-status-txt'); if(el
 
 function mpJoin(team){
   const nameEl=document.getElementById('menu-name');
-  const url='wss://pew-pew-pew-online-production.up.railway.app';
+  const urlEl=document.getElementById('mp-url');
+  const url=(urlEl?urlEl.value.trim():'')||'wss://pew-pew-pew-online-production.up.railway.app';
   const name=(nameEl?nameEl.value.trim():'JOUEUR')||'JOUEUR';
   mpStatus('Connexion à '+url+' …');
   try { _mpWs=new WebSocket(url); } catch(e){ mpStatus('URL invalide'); return; }
-  _mpWs.onopen=()=>{ _mpConnected=true; mpStatus('Connecté — rejoindre équipe '+team+'…'); _mpWs.send(JSON.stringify({type:'join',team,name})); };
+  _mpWs.onopen=()=>{ _mpConnected=true; _mpSavedParams={url,team,name}; _mpDisconnected=false; _mpReconnectAttempts=0; mpStatus('Connecté — rejoindre équipe '+team+'…'); _mpWs.send(JSON.stringify({type:'join',team,name})); };
   _mpWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} mpHandleMsg(m); };
   _mpWs.onclose=()=>{
-    _mpConnected=false; mpStatus('Déconnecté');
-    mpLog('❌ Déconnecté du serveur');
-    // Éviter que le mode spectateur solo s'active après déconnexion MP
-    // (ship.dead=true est mis dans mpBegin, il faut le réinitialiser)
-    ship.dead=false; ship.hp=100;
-    // Afficher une notification de déconnexion à l'écran
-    playerFeedback.push({type:'notif',label:'⚠ Déconnecté',life:300,maxLife:300});
+    _mpConnected=false;
+    if(_gameStarted&&_mpSavedParams){
+      // Connexion perdue en cours de partie : bloquer + reconnexion auto
+      _mpDisconnected=true; _mpReconnectTimer=180; // 3s avant 1er essai
+      mpStatus('Connexion perdue…');
+    }
   };
   _mpWs.onerror=()=>{ mpStatus('Erreur de connexion — verifiez l URL'); };
 }
@@ -233,7 +297,22 @@ function mpHandleMsg(msg){
       mpUnmarkBot(msg.team,msg.slot);
       break;
     }
-    case 'promoted_host':{ _mpIsHost=true; break; }
+    case 'promoted_host':{
+      _mpIsHost=true;
+      mpLog("⚡ Vous etes maintenant l'hote de la simulation");
+      mpStatus("HOST — simulation active");
+      break;
+    }
+    case 'demoted_client':{
+      _mpIsHost=false;
+      mpLog("Role d'hote transfere — vous etes maintenant client");
+      mpStatus("CLIENT — en attente");
+      break;
+    }
+    case 'restart':{
+      setTimeout(()=>location.reload(),200);
+      break;
+    }
     case 'input':{
       _mpNetKeys.set(msg.team+'_'+msg.slot,msg.keys);
       if(msg.x!==undefined){
@@ -243,6 +322,7 @@ function mpHandleMsg(msg){
           hp:msg.hp,dead:msg.dead,respawnTimer:msg.respawnTimer,
           immuneTimer:msg.immuneTimer,shield:msg.shield});
         _mpDbgRx=((_mpDbgRx||0)+1);
+        if(msg.t) _mpLastClientT=msg.t;
       }
       // Balles tirées par le CLIENT ce frame → ajoutées à la simulation de l'hôte
       if(msg.bul&&msg.bul.length&&typeof bullets!=='undefined'){
@@ -250,16 +330,47 @@ function mpHandleMsg(msg){
         const _cai=_cfl[msg.slot];
         for(const _cb of msg.bul){
           if(bullets.length<(typeof MAX_BULLETS!=='undefined'?MAX_BULLETS:400)){
-            bullets.push({x:_cb[0],y:_cb[1],vx:_cb[2],vy:_cb[3],
-              team:msg.team,life:typeof BULLET_LIFE!=='undefined'?BULLET_LIFE:80,
-              target:null,shooter:_cai||null,homing:false,zeroDmg:false});
+            let _cbtgt=null;
+            if(_cb[4]>=0&&_cb[5]>=0){
+              const _cba=_cb[4]===0?blues:reds;
+              const _cbc=_cba[_cb[5]];
+              if(_cbc&&!_cbc.dead) _cbtgt=_cbc;
+            }
+            // Missile cosmétique pour le CLIENT relay (hitscan)
+            if(bullets.length<(typeof MAX_BULLETS!=='undefined'?MAX_BULLETS:400)){
+              // Vie = distance/vitesse pour que la balle s'arrête exactement sur la cible
+              const _cspd2=typeof BULLET_SPEED!=='undefined'?BULLET_SPEED:8;
+              const _cbDist=_cbtgt?Math.hypot(_cbtgt.x-_cb[0],_cbtgt.y-_cb[1]):(typeof FIRE_RANGE!=='undefined'?FIRE_RANGE:400);
+              const _cbL=_cbtgt?Math.max(4,Math.round(_cbDist/_cspd2)+2):80;
+              bullets.push({x:_cb[0],y:_cb[1],vx:_cb[2],vy:_cb[3],
+                team:msg.team,life:_cbL,_maxLife:_cbL,
+                target:_cbtgt,shooter:_cai||null,homing:false,zeroDmg:false,
+                _pSlot:msg.slot,cosmetic:true});
+              sfxShoot(_cb[0],_cb[1]);
+            }
+            // PendingHit pour dégâts synchronisés
+            if(_cbtgt&&_cai){
+              const _cspd=typeof BULLET_SPEED!=='undefined'?BULLET_SPEED:8;
+              const _cdist=Math.hypot(_cbtgt.x-_cb[0],_cbtgt.y-_cb[1]);
+              const _cfly=Math.max(4,Math.round(_cdist/_cspd));
+              _pendingHits.push({target:_cbtgt,shooter:_cai,framesLeft:_cfly,homing:false});
+            }
           }
         }
       }
       break;
     }
     case 'state':{
-      if(!_mpIsHost) _mpPending=msg;
+      if(!_mpIsHost){
+        // Mesure RTT : le HOST a echo notre timestamp
+        if(msg._clientT){
+          const _rtt=Date.now()-msg._clientT;
+          _mpRTT=_mpRTT*0.85+_rtt*0.15; // lissage exponentiel
+          // LAG = demi-RTT en frames (one-way latency / frame time)
+          _mpLAG=Math.round(Math.max(1,Math.min(5,(_mpRTT/2)/(1000/60))));
+        }
+        _mpPending=msg;
+      }
       break;
     }
     case 'error':{ mpStatus('Serveur: '+msg.msg); break; }
@@ -296,17 +407,9 @@ function mpBegin(playerName){
   // Le ship traditionnel est désactivé
   ship.dead=true; ship.hp=0; _playerLives=0;
 
-  // Mode MP : retirer astéroïdes, météores et stations (solo uniquement)
-  if(_mpConnected){ ASTEROIDS.length=0; meteors.length=0; meteorWarn=0; meteorNotif=0; spawns.length=0; }
-  // MAP TEST : tuer tous les bots non-joueurs sauf un bot cible rouge invincible
-  for(const ai of blues) if(!ai._netPid){ ai.dead=true; ai.respawnTimer=999999; }
-  let _testBotSet=false;
-  for(const ai of reds){
-    if(!ai._netPid){
-      if(!_testBotSet){ ai._testBot=true; ai.dead=false; ai.hp=ai.maxHp; ai.immuneTimer=0; _testBotSet=true; }
-      else { ai.dead=true; ai.respawnTimer=999999; }
-    }
-  }
+  // Mode MP : retirer astéroïdes et météores (solo uniquement) - les spawners restent actifs
+  if(_mpConnected){ ASTEROIDS.length=0; meteors.length=0; meteorWarn=0; meteorNotif=0; }
+  // IA normales actives en MP — bots non-joueurs conservés tels quels
   // Réinitialiser l'état de fin de partie
   gameOver=null;
   // Lancer la partie
@@ -325,21 +428,48 @@ function mpSendState(){
     shield:s.shield,shieldHit:s.shieldHit||0,shieldTimer:s.shieldTimer||0,
     immuneTimer:s.immuneTimer||0,
     dead:s.dead,respawnTimer:s.respawnTimer||0,shipType:s.shipType,team:s.team,name:s.name,
-    isMercenary:!!s.isMercenary}:null;
+    isMercenary:!!s.isMercenary,
+    kills:s.kills||0,caps:s.caps||0,dmgDealt:s.dmgDealt||0}:null;
   _mpWs.send(JSON.stringify({
     type:'state',
+    _clientT:_mpLastClientT||0,
     blues:blues.map(ser), reds:reds.map(ser),
     hostShip:ser(ship),
     beacon:{x:BEACON.x,y:BEACON.y,capTeam:BEACON.capTeam,progress:BEACON.progress,contestTeam:BEACON.contestTeam},
     spawns:spawns.map(s=>({team:s.team,x:s.x,y:s.y,capTeam:s.capTeam,progress:s.progress,
       turrets:s.turrets.map(t=>({angle:+t.angle.toFixed(3),hp:t.hp,respawnTimer:t.respawnTimer||0}))})),
-    rally:_rallyNotif?{type:_rallyNotif.type,life:_rallyNotif.life,maxLife:_rallyNotif.maxLife,lines:_rallyNotif.lines}:null,
+    rally:_rallyNotif?{type:_rallyNotif.type,life:_rallyNotif.life,maxLife:_rallyNotif.maxLife,lines:_rallyNotif.lines,fromTeam:_rallyNotif.fromTeam||'blue',hostTeam:ship.team||'blue'}:null,
     logs:gameLog.map(e=>({parts:e.parts,seq:e.seq})),
     blueT:teamLives.blue, redT:teamLives.red,
-    gameOver:!!gameOver,
+    gameOver:gameOver||null,
     // Balles : format compact [x,y,vx,vy,team(0=bleu/1=rouge),life,zeroDmg]
-    bul:bullets.map(b=>[Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2),b.team==='blue'?0:1,b.life,b.zeroDmg?1:0]),
+    bul:bullets.map(b=>[Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2),b.team==='blue'?0:1,b.life,b.zeroDmg?1:0,b._pSlot!==undefined?b._pSlot:-1,b._maxLife||BULLET_LIFE]),
     pk:pickups.map(p=>[Math.round(p.x),Math.round(p.y),p.life]),
+    laz:lasers.map(lz=>{
+      let _sT,_sI,_tT=-1,_tI=-1;
+      if(lz._station&&lz._spawnIdx!==undefined&&lz._spawnIdx>=0){
+        // Laser de station : type 3, index spawn, cible en coordonnées absolues
+        _sT=3; _sI=lz._spawnIdx;
+        _tT=lz.target?Math.round(lz.target.x):-1;
+        _tI=lz.target?Math.round(lz.target.y):-1;
+      } else {
+        // Sérialiser shooter : 0=blue, 1=red, 2=player
+        _sT=lz.owner==='player'?2:(lz.shooter&&lz.shooter.team==='blue'?0:1);
+        _sI=_sT===2?0:(_sT===0?blues.indexOf(lz.shooter):reds.indexOf(lz.shooter));
+        if(lz.target&&!lz.target.dead){
+          _tT=lz.target.team==='blue'?0:1;
+          _tI=_tT===0?blues.indexOf(lz.target):reds.indexOf(lz.target);
+        }
+      }
+      return [_sT,_sI,_tT,_tI,lz.team==='blue'?0:1,
+              lz.side==='center'?2:lz.side==='right'?1:0,
+              lz.life,lz.maxLife,lz._station?1:0];
+    }),
+    rm:_rallyMarkers.map(rm=>{
+      const _rt=rm.t3&&rm.t3.team==='blue'?0:1;
+      const _ri=_rt===0?blues.indexOf(rm.t3):reds.indexOf(rm.t3);
+      return [_rt,_ri,rm.team==='blue'?0:1,rm.life,rm.maxLife,rm.type==='attack'?0:1];
+    }).filter(rm=>rm[1]>=0),
   }));
 }
 
@@ -355,43 +485,63 @@ function mpApplyState(s){
   const lerpShip=(obj,d,own)=>{
     if(!obj||!d)return;
     if(own){
-      // Position : le client est autoritaire — pas de correction depuis l'hôte
-      // Exception : premier état (position initiale) et respawn
+      // Premier état : snap immédiat sur la position HOST
       if(_mpFirstState){
         obj.x=d.x; obj.y=d.y; obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
+      } else if(!obj.dead){
+        // Correction vers position HOST extrapolée (position HOST + vitesse × LAG)
+        // → compense le retard réseau, évite de tirer le vaisseau en arrière
+        const _exX=d.x+(d.vx||0)*_mpLAG, _exY=d.y+(d.vy||0)*_mpLAG;
+        const _pdx=_exX-obj.x, _pdy=_exY-obj.y;
+        const _pdist=Math.hypot(_pdx,_pdy);
+        // Correction seulement si grand écart (>60px) — désync réel, pas lag normal
+        if(_pdist>60){
+          const _pf=Math.min(8,_pdist*0.08)/_pdist;
+          obj.x+=_pdx*_pf; obj.y+=_pdy*_pf;
+        }
       }
-      // Mémoriser la position reportée par l'hôte (référentiel des balles)
+      // Mémoriser la position reportée par l'hôte
       _mpHostReportedX=d.x; _mpHostReportedY=d.y;
       // Modèle relay : CLIENT est autoritaire pour sa propre mort/respawn
       // HOST transmet bouclier et hit pour les feedbacks visuels
       if(!obj.dead){ // seulement si vivant — éviter d'écraser l'état mort local
-        if(d.hit>0&&(obj.hit||0)<d.hit) obj.hit=d.hit;
+        if(d.hit>0&&(obj.hit||0)<d.hit){
+          obj.hit=d.hit;
+          if(d.shieldHit) playSound('shield',0.35);
+          else playSound('explode',0.18);
+        }
         obj.shield=d.shield;
         if(d.shieldHit!==undefined) obj.shieldHit=d.shieldHit;
         if(d.shieldTimer!==undefined) obj.shieldTimer=d.shieldTimer;
       }
-      // Mort/respawn : CLIENT décide lui-même (via collision locale), HOST ne l'écrase pas
-      // Exception : HOST confirme un respawn (dead=false alors que CLIENT est mort ET son timer est épuisé)
-      if(!d.dead&&obj.dead&&obj.respawnTimer<=0){
-        // HOST a respawné le vaisseau ET le CLIENT n'attend plus → accepter position du HOST
-        mpLog(`CLIENT: respawn HOST accepté (timer=0) pos=${Math.round(d.x)},${Math.round(d.y)}`);
-        obj.dead=false; obj.respawnTimer=0;
-        obj.x=d.x; obj.y=d.y; obj.vx=d.vx; obj.vy=d.vy; obj.angle=d.angle;
+      // HP/mort/respawn : HOST pleinement autoritaire
+      if(d.hp!==undefined) obj.hp=d.hp;
+      if(d.dead&&!obj.dead){ addExplosion(obj.x,obj.y,obj.team); }
+      if(!d.dead&&obj.dead){
+        mpLog(`CLIENT: respawn pos=${Math.round(d.x)},${Math.round(d.y)}`);
+        obj.x=d.x; obj.y=d.y; obj.vx=d.vx||0; obj.vy=d.vy||0; obj.angle=d.angle||0;
       }
+      obj.dead=d.dead;
+      if(d.respawnTimer!==undefined) obj.respawnTimer=d.respawnTimer;
+      if(d.immuneTimer!==undefined) obj.immuneTimer=d.immuneTimer;
     } else {
-      // Autres vaisseaux — lerp direct vers la position rapportée
-      const _dist=Math.hypot(d.x-obj.x,d.y-obj.y);
+      // Autres vaisseaux — lerp VERS la cible extrapolée (dead reckoning)
+      const _LAG=_mpLAG; // frames dynamiques selon RTT mesuré
+      // Cible = position HOST + extrapolation de vitesse × LAG
+      const _tx=d.x+d.vx*_LAG, _ty=d.y+d.vy*_LAG;
+      const _dist=Math.hypot(_tx-obj.x,_ty-obj.y);
       if(_mpFirstState||_dist>400||(d.dead===false&&obj.dead)){
-        obj.x=d.x; obj.y=d.y;
+        obj.x=_tx; obj.y=_ty; // snap direct sur la cible extrapolée
       } else {
-        const _lr=_dist>80?0.85:_dist>20?0.6:0.35;
-        obj.x+=(d.x-obj.x)*_lr; obj.y+=(d.y-obj.y)*_lr;
+        // Lerp directement vers la cible extrapolée (formule correcte)
+        const _lr=_dist>80?0.95:_dist>20?0.85:0.7;
+        obj.x+=(_tx-obj.x)*_lr; obj.y+=(_ty-obj.y)*_lr;
       }
       obj.vx=d.vx; obj.vy=d.vy;
       obj.angVel=d.angVel||0;
       obj.angle=(_mpFirstState||(d.dead===false&&obj.dead))
-        ? d.angle
-        : _lerpAngle(obj.angle,d.angle,0.4);
+        ? d.angle+d.angVel*_LAG
+        : _lerpAngle(obj.angle,d.angle+d.angVel*_LAG,0.7);
       obj.hp=d.hp; if(d.maxHp)obj.maxHp=d.maxHp;
       if(d.hit>0&&(obj.hit||0)<d.hit) obj.hit=d.hit;
       obj.shield=d.shield;
@@ -404,6 +554,9 @@ function mpApplyState(s){
       obj.immuneTimer=d.immuneTimer||0;
       if(d.shieldHit!==undefined) obj.shieldHit=d.shieldHit;
       if(d.shieldTimer!==undefined) obj.shieldTimer=d.shieldTimer;
+      if(d.kills!==undefined) obj.kills=d.kills;
+      if(d.caps!==undefined) obj.caps=d.caps;
+      if(d.dmgDealt!==undefined) obj.dmgDealt=d.dmgDealt;
     }
   };
   s.blues.forEach((d,i)=>{
@@ -463,10 +616,33 @@ function mpApplyState(s){
       }
     }
   }
-  // Bannière rally (offensive/défensive) : afficher côté non-hôte
+  // Bannière rally : adapter la perspective selon l'équipe du CLIENT vs l'HOST
   if(s.rally){
-    if(!_rallyNotif||_rallyNotif.type!==s.rally.type) _rallyNotif=s.rally;
-    else _rallyNotif.life=s.rally.life; // rafraîchir la durée depuis l'hôte
+    const _sr=s.rally;
+    let _adjRally=_sr;
+    // Si CLIENT et HOST sont dans des équipes opposées → inverser attack/defend
+    if(_mpMyTeam&&_sr.hostTeam&&_sr.hostTeam!==_mpMyTeam){
+      const _t3Line=_sr.lines[_sr.lines.length-1]; // ex: "[ Leviathan Rex ]"
+      if(_sr.type==='defend'){
+        // HOST défend (ennemi attaque son T3) → CLIENT est l'attaquant
+        _adjRally={type:'attack',life:_sr.life,maxLife:_sr.maxLife,fromTeam:_sr.fromTeam,hostTeam:_sr.hostTeam,
+          lines:[
+            {text:'— RENFORT —',col:'#ff9933'},
+            {text:'Attaque sur',col:'#ffccaa'},
+            {text:_t3Line.text,col:'#ff4444'}
+          ]};
+      } else if(_sr.type==='attack'){
+        // HOST attaque → CLIENT doit défendre son T3
+        _adjRally={type:'defend',life:_sr.life,maxLife:_sr.maxLife,fromTeam:_sr.fromTeam,hostTeam:_sr.hostTeam,
+          lines:[
+            {text:'— ALERTE —',col:'#ff4444'},
+            {text:'Ennemi attaque',col:'#ffaaaa'},
+            {text:_t3Line.text,col:'#4aadff'}
+          ]};
+      }
+    }
+    if(!_rallyNotif||_rallyNotif.type!==_adjRally.type) _rallyNotif=_adjRally;
+    else _rallyNotif.life=_sr.life;
   } else if(!s.rally&&_rallyNotif){
     // L'hôte n'a plus de notif → laisser la locale finir de décliner
   }
@@ -475,10 +651,33 @@ function mpApplyState(s){
   // Balles : remplacer le tableau local par l'état autoritaire de l'hôte
   if(s.bul){
     bullets.length=0;
+    const _myTi=_mpMyTeam==='blue'?0:1;
     for(const b of s.bul){
-      bullets.push({x:b[0],y:b[1],vx:b[2],vy:b[3],team:b[4]===0?'blue':'red',life:b[5],zeroDmg:!!b[6]});
+      // CLIENT : sauter ses propres balles (remplacées par _mpLocalBullets)
+      if(!_mpIsHost && b[7]===_mpMySlot && b[4]===_myTi) continue;
+      // Dead reckoning balles : avancer de LAG frames pour compenser la latence
+      const _bLAG=_mpLAG;
+      bullets.push({x:b[0]+b[2]*_bLAG,y:b[1]+b[3]*_bLAG,vx:b[2],vy:b[3],team:b[4]===0?'blue':'red',life:b[5],_maxLife:b[8]||BULLET_LIFE,zeroDmg:!!b[6]});
     }
-
+    // Réinjecter les balles locales du CLIENT (sans latence)
+    if(!_mpIsHost){
+      _mpLocalBullets=_mpLocalBullets.filter(b=>{
+        b.x+=b.vx; b.y+=b.vy; b.life--;
+        // Guidance légère (même logique que le main loop) pour garder vx/vy à jour
+        if(b.target&&!b.target.dead){
+          let _da=Math.atan2(b.target.y-b.y,b.target.x-b.x)-Math.atan2(b.vy,b.vx);
+          while(_da>Math.PI)_da-=Math.PI*2; while(_da<-Math.PI)_da+=Math.PI*2;
+          const _turn=Math.max(-0.07,Math.min(0.07,_da));
+          const _spd=Math.hypot(b.vx,b.vy);
+          const _na=Math.atan2(b.vy,b.vx)+_turn;
+          b.vx=Math.cos(_na)*_spd; b.vy=Math.sin(_na)*_spd;
+        }
+        return b.life>0;
+      });
+      for(const _lb of _mpLocalBullets){
+        bullets.push({x:_lb.x,y:_lb.y,vx:_lb.vx,vy:_lb.vy,team:_lb.team,life:_lb.life,_maxLife:_lb._maxLife||_lb.life,zeroDmg:_lb.zeroDmg,cosmetic:!!_lb.cosmetic,target:_lb.target||null});
+      }
+    }
   }
   // Pickups : sync complet depuis l'hôte (les pickups collectés disparaissent naturellement)
   if(s.pk){
@@ -490,11 +689,45 @@ function mpApplyState(s){
       pickups.push({x:p[0],y:p[1],life:p[2],rot:_rot});
     }
   }
+  // Lasers : reconstruire les références shooter/target depuis indices
+  if(s.laz){
+    lasers.length=0;
+    for(const lz of s.laz){
+      let _sh,_tg=null;
+      if(lz[0]===3){
+        // Laser de station : reconstruire shooter depuis spawns[]
+        const _sp=spawns[lz[1]];
+        if(!_sp) continue;
+        _sh={x:_sp.x,y:_sp.y,angle:lz[2]!==-1?Math.atan2(lz[3]-_sp.y,lz[2]-_sp.x):0,
+             dead:false,team:_sp.team,shipType:3};
+        _tg=lz[2]!==-1?{x:lz[2],y:lz[3],dead:false}:null;
+      } else {
+        if(lz[0]===2) _sh=_mpMyShip||null;
+        else if(lz[0]===0) _sh=blues[lz[1]];
+        else _sh=reds[lz[1]];
+        if(!_sh) continue;
+        if(lz[2]===0&&lz[3]>=0) _tg=blues[lz[3]]||null;
+        else if(lz[2]===1&&lz[3]>=0) _tg=reds[lz[3]]||null;
+      }
+      lasers.push({shooter:_sh,target:_tg,team:lz[4]===0?'blue':'red',
+        side:lz[5]===2?'center':lz[5]===1?'right':'left',
+        life:lz[6],maxLife:lz[7],dmgTimer:0,
+        owner:lz[0]===2?'player':null,_station:!!lz[8]});
+    }
+  }
+  // Rally markers : reconstruire depuis indices
+  if(s.rm){
+    _rallyMarkers=s.rm.map(rm=>{
+      const _t3=rm[0]===0?blues[rm[1]]:reds[rm[1]];
+      if(!_t3) return null;
+      return {t3:_t3,team:rm[2]===0?'blue':'red',life:rm[3],maxLife:rm[4],type:rm[5]===0?'attack':'defend'};
+    }).filter(Boolean);
+  }
   if(_mpFirstState) _mpFirstState=false;
 }
 
 // ── Envoi inputs (non-host → serveur, chaque frame) ─────────────────────
-let _mpLastInput=0, _mpClientNewBullets=[];
+let _mpLastInput=0, _mpClientNewBullets=[], _mpLocalBullets=[];
 function mpSendInput(){
   if(_mpIsHost||!_mpWs||_mpWs.readyState!==1) return;
   const _now=Date.now(); if(_now-_mpLastInput<16) return; _mpLastInput=_now; // ~60fps
@@ -505,7 +738,7 @@ function mpSendInput(){
     _mis.x=0; _mis.y=0; _mis.vx=0; _mis.vy=0;
   }
   _mpDbgTx=((_mpDbgTx||0)+1);
-  _mpWs.send(JSON.stringify({type:'input',
+  _mpWs.send(JSON.stringify({type:'input',t:_now,
     keys:{left:!!keys.left,right:!!keys.right},
     x:_mis?+_mis.x.toFixed(1):undefined,
     y:_mis?+_mis.y.toFixed(1):undefined,
@@ -513,14 +746,9 @@ function mpSendInput(){
     vy:_mis?+_mis.vy.toFixed(3):undefined,
     angle:_mis?+_mis.angle.toFixed(4):undefined,
     angVel:_mis?+(_mis.angVel||0).toFixed(5):undefined,
-    // CLIENT rapporte son propre état → HOST fait confiance (modèle relay)
-    hp:_mis?_mis.hp:undefined,
-    dead:_mis?!!_mis.dead:undefined,
-    respawnTimer:_mis?(_mis.respawnTimer||0):undefined,
-    immuneTimer:_mis?(_mis.immuneTimer||0):undefined,
-    shield:_mis?_mis.shield:undefined,
     // Balles tirées par le CLIENT ce frame → l'hôte les ajoute à sa simulation
     bul:_mpClientNewBullets.length?_mpClientNewBullets:undefined,
+    rtt:Math.round(_mpRTT),
     slot:_mpMySlot,team:_mpMyTeam}));
   _mpClientNewBullets=[];
 }
@@ -546,6 +774,7 @@ function updateNetPlayer(ai,nk,_noBullets,_skipPhysics){
   // Timers visuels/état (normalement gérés dans updateAI, il faut les faire ici aussi)
   if(ai.hit>0) ai.hit--;
   if(ai.immuneTimer>0) ai.immuneTimer--;
+  if(ai._hitImmune>0) ai._hitImmune--;
   if(ai.shieldHit>0) ai.shieldHit--;
   if(ai.speedBoost>0) ai.speedBoost--;
   // Régénération bouclier complète (évite le flash blanc permanent + recharge côté non-hôte)
@@ -564,19 +793,38 @@ function updateNetPlayer(ai,nk,_noBullets,_skipPhysics){
   const _foes=ai.team==='blue'?reds:blues;
   if(ai.burstLeft>0){
     if(--ai.burstTimer<=0){
-      if(bullets.length<MAX_BULLETS){
-        bullets.push({x:ai.x,y:ai.y,
-          vx:Math.cos(ai.angle)*BULLET_SPEED+ai.vx*0.25,
-          vy:Math.sin(ai.angle)*BULLET_SPEED+ai.vy*0.25,
-          team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,
-          shooter:ai,wx:ai.x,wy:ai.y,homing:false});
-        sfxShoot(ai.x,ai.y);
-      }
+      {const _vx=Math.cos(ai.angle)*BULLET_SPEED+ai.vx*0.25,_vy=Math.sin(ai.angle)*BULLET_SPEED+ai.vy*0.25;
+      fireBulletHitscan(ai,_vx,_vy,BULLET_SPEED,false,!!(ai.burstTarget&&ai.burstTarget._isTurret));}
       ai.burstLeft--; ai.burstTimer=BURST_DELAY;
     }
   } else {
-    let _bDist=FIRE_RANGE, _bTgt=null;
-    for(const _e of _foes){ if(_e.dead) continue; const _d=Math.hypot(_e.x-ai.x,_e.y-ai.y); if(_d<_bDist){_bDist=_d;_bTgt=_e;} }
+    // Ciblage : meilleure cible = mieux alignee (comme le joueur solo)
+    let _bDist=FIRE_RANGE, _bTgt=null, _bAfd=Infinity;
+    for(const _e of _foes){
+      if(_e.dead) continue;
+      const _d=Math.hypot(_e.x-ai.x,_e.y-ai.y);
+      if(_d>=FIRE_RANGE) continue;
+      const _t2=Math.min(_d/BULLET_SPEED,45);
+      let _fa=Math.atan2(_e.y+(_e.vy||0)*_t2-ai.y,_e.x+(_e.vx||0)*_t2-ai.x)-ai.angle;
+      while(_fa>Math.PI)_fa-=Math.PI*2; while(_fa<-Math.PI)_fa+=Math.PI*2;
+      const _afd=Math.abs(_fa);
+      if(_bTgt===null||_afd<_bAfd||(_afd<0.35&&_d<_bDist)){_bDist=_d;_bAfd=_afd;_bTgt=_e;}
+    }
+    // Ciblage tourelles ennemies
+    for(const _sp of spawns){
+      if(_sp.team==='neutral'||_sp.team===ai.team) continue;
+      for(const _tr of _sp.turrets){
+        if(_tr.hp<=0) continue;
+        const _tox=_sp.x+Math.cos(_tr.offsetAngle)*(_tr.offsetRadius||0);
+        const _toy=_sp.y+Math.sin(_tr.offsetAngle)*(_tr.offsetRadius||0);
+        const _td=Math.hypot(_tox-ai.x,_toy-ai.y);
+        if(_td>=FIRE_RANGE) continue;
+        let _tfa=Math.atan2(_toy-ai.y,_tox-ai.x)-ai.angle;
+        while(_tfa>Math.PI)_tfa-=Math.PI*2; while(_tfa<-Math.PI)_tfa+=Math.PI*2;
+        const _tafd=Math.abs(_tfa);
+        if(_bTgt===null||_tafd<_bAfd||(_tafd<0.35&&_td<_bDist)){_bDist=_td;_bAfd=_tafd;_bTgt={x:_tox,y:_toy,vx:0,vy:0,dead:false,_isTurret:true};}
+      }
+    }
     if(_bTgt){
       ai.fireTimer=(ai.fireTimer||0)-1;
       const _t2=Math.min(_bDist/BULLET_SPEED,45);
@@ -584,7 +832,7 @@ function updateNetPlayer(ai,nk,_noBullets,_skipPhysics){
       while(_fd>Math.PI)_fd-=Math.PI*2; while(_fd<-Math.PI)_fd+=Math.PI*2;
       if((ai.fireTimer||0)<=0&&Math.abs(_fd)<0.35){
         ai.burstLeft=ai.burstSz||BURST_SIZE; ai.burstTimer=1;
-        ai.fireTimer=Math.max(16,BURST_CD+Math.floor(Math.random()*12));
+        ai.fireTimer=Math.max(8,BURST_CD-(BURST_CD+22)+Math.floor(Math.random()*12)); // cadence joueur rapide
         ai.burstTarget=_bTgt;
       }
     }
@@ -762,7 +1010,7 @@ function updateDoppler(){
 }
 
 let _shootThrottle=0;
-function sfxShoot(wx,wy){ if(++_shootThrottle%4===0) playSound('shoot',0.22,wx,wy); }
+function sfxShoot(wx,wy){ if(++_shootThrottle%2===0) playSound('shoot',0.22,wx,wy); }
 let _astSfxThrottle=0; // anti-saturation sonore des impacts d'astéroïdes
 let _deathFxTimer=0;  // effet dramatique post-mort joueur
 let _gameTick=0;      // compteur de frames global
@@ -794,7 +1042,7 @@ const BURST_CD       = 38;
 const RESPAWN_FRAMES = 600;
 const AI_HP          = 4;
 const RED_AI_HP      = 4; // Rouges même HP que les bleus
-const PLAYER_HP      = 8;
+const PLAYER_HP      = 12;
 const ENGAGE_DIST    = 220;
 const TEAM_LIVES     = 1000;
 const SPAWN_RADIUS   = 140;
@@ -1172,6 +1420,7 @@ for(const p of _ALL_SP){
 const teamLives={blue:500, red:500};
 const initialLives={blue:500, red:500};
 let gameOver=null;
+let _goCountdown=0; // frames écoulées depuis gameOver (20s = 1200 frames)
 let _playerLives=Infinity; // Pas de limite de vies joueur
 let _score=0, _kills=0, _caps=0, _assists=0, _dmgDealt=0;
 let _killStreak=0, _streakTimer=0; // combo kills
@@ -1301,34 +1550,6 @@ assignT3Escorts(blues); assignT3Escorts(reds);
 const _bsrc=_t3src.length?_t3src:[{x:0,y:6000}];
 const sp=_bsrc[Math.floor(Math.random()*_bsrc.length)];
 ship.x=sp.x+(Math.random()-0.5)*200;ship.y=sp.y+(Math.random()-0.5)*200;}
-let formationTimer=480+Math.floor(Math.random()*480);
-let formationActive=false, formationNotif=0, formationFillTimer=0;
-
-function triggerFormation(){
-  if(ship.dead) return;
-  const alive=blues.filter(a=>!a.dead&&a.shipType!==3&&!a.isMercenary&&Math.hypot(a.x-ship.x,a.y-ship.y)<2200);
-  if(alive.length<2) return;
-  alive.sort((a,b)=>Math.hypot(a.x-ship.x,a.y-ship.y)-Math.hypot(b.x-ship.x,b.y-ship.y));
-  const count=Math.min(alive.length,FORM_SLOTS.length);
-  // Mémoriser qui était déjà dans l'escadron AVANT de modifier les slots
-  const already=new Set(blues.filter(a=>a.formSlot!==undefined).map(a=>a.name));
-  // Libérer les slots des bots non-retenus
-  for(const ai of blues) if(!alive.slice(0,count).includes(ai)) ai.formSlot=undefined;
-  for(let i=0;i<count;i++){
-    const isNew=!already.has(alive[i].name);
-    alive[i].formSlot=i;
-    if(isNew)
-      playerFeedback.push({type:'formation', label:`${alive[i].name} a rejoint l'escadron`, life:180, maxLife:180, row:i});
-  }
-  formationActive=true; formationNotif=210;
-}
-function getSlotPos(slot){
-  const s=FORM_SLOTS[slot];
-  return{
-    x:ship.x+Math.cos(ship.angle)*s.fwd-Math.sin(ship.angle)*s.lat,
-    y:ship.y+Math.sin(ship.angle)*s.fwd+Math.cos(ship.angle)*s.lat
-  };
-}
 
 const bullets=[], particles=[], pickups=[], playerFeedback=[], lasers=[];
 const MAX_LASERS=32;
@@ -1418,7 +1639,7 @@ function asteroidBounce(obj,nearby){
             addExplosion(obj.x,obj.y,obj.team);
             if(!obj.isMercenary) teamLives[obj.team]--; dropPickup(obj.x,obj.y);
             playSound('explode',0.55,obj.x,obj.y);
-            if(obj===ship) addLog([{text:'JOUEUR',col:teamCol('blue')},{text:' écrasé sur un astéroïde',col:'#888'}]);
+            if(obj===ship) addLog([{text:ship.name,col:teamCol(ship.team)},{text:' écrasé sur un astéroïde',col:'#888'}]);
             else addLog([{text:obj.name,col:teamCol(obj.team)},{text:' écrasé sur un astéroïde',col:'#888'}]);
           }
         }
@@ -1479,7 +1700,7 @@ function takeHit(obj){
 // ── Capture ───────────────────────────────────────────────────────────────
 function updateCaptures(){
   for(const sp of spawns){
-    const blueShips=[...blues,ship],redShips=reds;
+    const blueShips=_mpConnected?[...blues]:[...blues,...(ship.dead?[]:[ship])],redShips=reds;
     let atkTeam=null,atkN=0,defN=0;
     if(sp.team==='blue'){
       atkN=redShips.filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS).length;
@@ -1506,7 +1727,7 @@ function updateCaptures(){
       sp.progress+=capRate;
       if(sp.progress>=CAPTURE_FRAMES){
         const newTeam=atkTeam;
-        const cappers=(newTeam==='blue'?[...blues,ship]:reds).filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS);
+        const cappers=(newTeam==='blue'?(_mpConnected?[...blues]:[...blues,...(ship.dead?[]:[ship])]):reds).filter(a=>!a.dead&&Math.hypot(a.x-sp.x,a.y-sp.y)<SPAWN_RADIUS);
         const capper=cappers.length?cappers[0]:null;
         const capName=capper?(capper===ship?'JOUEUR':capper.name):'?';
         const capTeam=capper?(capper===ship?'blue':capper.team):'blue';
@@ -1582,7 +1803,6 @@ function updateAI(ai,enemies){
       ai.vx=ai.vy=ai.angVel=0; ai.angle=ai.team==='blue'?-Math.PI/2:Math.PI/2;
       ai.hp=ai.maxHp; ai.dead=false; ai.burstLeft=0; ai.burstTarget=null;
       ai.shield=ai.maxShield??SHIELD_MAX; ai.shieldTimer=0; ai.shieldHit=0; ai.immuneTimer=SPAWN_IMMUNE;
-      ai.formSlot=undefined;
       ai.fireTimer=BURST_CD+Math.floor(Math.random()*80);
       ai.strafeDir=Math.sign(Math.random()-0.5);
       ai.strafeTimer=20+Math.floor(Math.random()*90);
@@ -1666,7 +1886,7 @@ function updateAI(ai,enemies){
     repX+=ddx/dd*str; repY+=ddy/dd*str;
   }
   // Légère répulsion ennemis proches (évite le chevauchement)
-  const foes=ai.team==='blue'?reds:[...blues,ship];
+  const foes=ai.team==='blue'?reds:(_mpConnected||ship.dead?blues:[...blues,ship]);
   for(const f of foes){
     if(f.dead)continue;
     const fdx=ai.x-f.x,fdy=ai.y-f.y,fd=Math.hypot(fdx,fdy);
@@ -1715,25 +1935,13 @@ function updateAI(ai,enemies){
     &&(BEACON.capTeam!==ai.team||BEACON.contestTeam!==null)
     &&(!target||tDist>700)&&_beaconDist<8000;
 
-  // Formation d'escorte autour du joueur (bleus)
-  let wantForm=false;
-  if(ai.formSlot!==undefined&&ai.team==='blue'&&!ship.dead&&ai.shipType!==3) wantForm=true;
+  const wantForm=false;
   // Escorte T3 (toute équipe, actif uniquement si T3 vivant et pas de formSlot joueur)
   const _t3leader=ai.escortOf&&!ai.escortOf.dead?ai.escortOf:null;
   const wantEscort=_t3leader&&!wantForm&&ai.shipType!==3;
 
   let desAngle=ai.angle;
   if(repStr>1){desAngle=Math.atan2(repY,repX);}
-  else if(wantForm){
-    const sp2=getSlotPos(ai.formSlot);
-    const dx2=sp2.x-ai.x, dy2=sp2.y-ai.y, slotDist=Math.hypot(dx2,dy2);
-    // Si on est sur le slot et qu'un ennemi est visible, tirer quand même
-    if(slotDist>50||!target){desAngle=Math.atan2(dy2,dx2);}
-    else{
-      const t3=Math.min(tDist/BULLET_SPEED,45);
-      desAngle=Math.atan2(target.y+target.vy*t3-ai.y,target.x+target.vx*t3-ai.x);
-    }
-  }
   else if(wantPickup){desAngle=Math.atan2(pkTgt.y-ai.y,pkTgt.x-ai.x);}
   else if(wantBeacon){
     // Dans la zone → viser ennemis proches, sinon foncer vers la balise
@@ -1888,12 +2096,13 @@ function updateAI(ai,enemies){
   ai.angle+=ai.angVel; ai.x+=ai.vx; ai.y+=ai.vy;
   asteroidBounce(ai,nearby);
   if(ai.hit>0) ai.hit--;
+  if(ai._hitImmune>0) ai._hitImmune--;
 
   if(ai.burstLeft>0){
     if(--ai.burstTimer<=0){
       if(ai.shipType===3){
         // Type 3 : 2 lasers latéraux (gauche + droite) ciblant indépendamment
-        const foes=ai.team==='blue'?[...reds]:[...blues,ship];
+        const foes=ai.team==='blue'?[...reds]:(_mpConnected||ship.dead?[...blues]:[...blues,ship]);
         const _lfw2=Math.cos(ai.angle),_lfu2=Math.sin(ai.angle);
         const _llx2=-_lfu2,_lly2=_lfw2;
         for(const _side of ['left','right']){
@@ -1916,10 +2125,10 @@ function updateAI(ai,enemies){
         }
       } else {
         if(bullets.length<MAX_BULLETS){
-          const _bspd=ai.shipType===2?TYPE2_BULLET_SPD:BULLET_SPEED;
+          {const _bspd=ai.shipType===2?TYPE2_BULLET_SPD:BULLET_SPEED;
           const _bhome=ai.shipType===2;
-          bullets.push({x:ai.x,y:ai.y,vx:Math.cos(ai.angle)*_bspd+ai.vx*0.25,vy:Math.sin(ai.angle)*_bspd+ai.vy*0.25,team:ai.team,life:BULLET_LIFE,target:ai.burstTarget,shooter:ai,wx:ai.x,wy:ai.y,homing:_bhome,zeroDmg:!!ai._testBot});
-          sfxShoot(ai.x,ai.y);
+          const _bvx=Math.cos(ai.angle)*_bspd+ai.vx*0.25,_bvy=Math.sin(ai.angle)*_bspd+ai.vy*0.25;
+          fireBulletHitscan(ai,_bvx,_bvy,_bspd,_bhome,!!ai._testBot);}
         }
       }
       ai.burstLeft--; ai.burstTimer=BURST_DELAY;
@@ -1930,7 +2139,7 @@ function updateAI(ai,enemies){
     let fd=Math.atan2(target.y+target.vy*t2-ai.y,target.x+target.vx*t2-ai.x)-ai.angle;
     while(fd>Math.PI)fd-=Math.PI*2; while(fd<-Math.PI)fd+=Math.PI*2;
     // Avantage caché : imprécision + cooldown allongé quand un rouge vise le joueur
-    const vsPlayer=ai.team==='red'&&target===ship;
+    const vsPlayer=ai.team==='red'&&(target===ship||target._netPid!==undefined);
     const aimNoise=vsPlayer?(Math.random()-0.5)*0.09:0;
     // Légère pénalité CD vs joueur pour les deux équipes
     const cdBonus=vsPlayer?20:-(BURST_CD+35);
@@ -1953,7 +2162,7 @@ function updateSpawnTurrets(){
   const TURRET_OFFSET=30;
   for(const sp of spawns){
     if(sp.team==='neutral') continue;
-    const foes=sp.team==='blue'?[...reds]:[...blues,ship];
+    const foes=sp.team==='blue'?[...reds]:(_mpConnected||ship.dead?[...blues]:[...blues,ship]);
     sp.dead=!sp.turrets.some(t=>t.hp>0); // mise à jour pour ciblage IA
     for(const tr of sp.turrets){
       if(tr.hp<=0){
@@ -1985,7 +2194,7 @@ function updateSpawnTurrets(){
               // cible fictive dans la direction courante
               const _fakeTarget={x:tx+Math.cos(tr.angle)*800,y:ty+Math.sin(tr.angle)*800,dead:false};
               lasers.push({shooter:_msh,target:_fakeTarget,team:sp.team,side:'center',
-                life:TYPE3_LASER_LIFE,maxLife:TYPE3_LASER_LIFE,dmgTimer:0,owner:null,_station:true});
+                life:TYPE3_LASER_LIFE,maxLife:TYPE3_LASER_LIFE,dmgTimer:0,owner:null,_station:true,_spawnIdx:spawns.indexOf(sp)});
               sfxShoot(tx,ty);
             }
           }
@@ -2131,7 +2340,7 @@ function updateWorldSystems(){
       }
     }
     // Collision avec vaisseaux — déviation + dégâts selon vitesse
-    const all=[...blues,...reds,...(ship.dead?[]:[ship])];
+    const all=[...blues,...reds,...(_mpConnected||ship.dead?[]:[ship])];
     for(const s of all){
       if(s.dead||s.immuneTimer>0||m.hitCooldown>0) continue;
       const dist=Math.hypot(m.x-s.x,m.y-s.y)||0.01;
@@ -2160,7 +2369,7 @@ function updateWorldSystems(){
             if(s===ship){
               _playerLives--;
               if(_playerLives<=0&&!_playerGameOver){_playerGameOver=true;if(_score>_highScore){_highScore=_score;localStorage.setItem(_hiKey,_highScore);}}
-              addLog([{text:'JOUEUR',col:teamCol('blue')},{text:' écrasé par un météore',col:'#888'}]);
+              addLog([{text:ship.name,col:teamCol(ship.team)},{text:' écrasé par un météore',col:'#888'}]);
             } else addLog([{text:s.name,col:teamCol(s.team)},{text:' écrasé par un météore',col:'#888'}]);
           }
         }
@@ -2217,7 +2426,7 @@ function updateWorldSystems(){
   _beaconSelfAngle+=0.004;
   // Capture station-like : contestation/possession permanente
   {
-    const _bNear=[...blues,...reds,...(ship.dead?[]:[ship])].filter(s=>!s.dead&&Math.hypot(s.x-BEACON.x,s.y-BEACON.y)<200);
+    const _bNear=[...blues,...reds,...(_mpConnected||ship.dead?[]:[ship])].filter(s=>!s.dead&&Math.hypot(s.x-BEACON.x,s.y-BEACON.y)<200);
     if(_bNear.length>0){
       const _bt=_bNear[0].team;
       const _bSame=_bNear.every(s=>s.team===_bt);
@@ -2266,7 +2475,7 @@ function updateWorldSystems(){
   } else {
     wreckLoot.life--; wreckLoot.rot+=0.02; wreckLoot.pulse=(wreckLoot.pulse+0.06)%(Math.PI*2);
     if(wreckLoot.life<=0){wreckLoot=null;return;}
-    const all=[...blues,...reds,...(ship.dead?[]:[ship])];
+    const all=[...blues,...reds,...(_mpConnected||ship.dead?[]:[ship])];
     for(const s of all){
       if(s.dead||s.shipType===3) continue; // Type 3 : pas de loot
       if(Math.hypot(s.x-wreckLoot.x,s.y-wreckLoot.y)<SHIP_RADIUS*4){
@@ -2312,7 +2521,7 @@ function applyGravity(obj, isBullet){
         if(obj===ship){
           _playerLives--;
           if(_playerLives<=0&&!_playerGameOver){_playerGameOver=true;if(_score>_highScore){_highScore=_score;localStorage.setItem(_hiKey,_highScore);}}
-          addLog([{text:'JOUEUR',col:teamCol('blue')},{text:' s\'est écrasé sur la planète',col:'#888'}]);
+          addLog([{text:ship.name,col:teamCol(ship.team)},{text:' s\'est écrasé sur la planète',col:'#888'}]);
         } else addLog([{text:obj.name,col:teamCol(obj.team)},{text:' s\'est écrasé sur la planète',col:'#888'}]);
       }
     }
@@ -2355,7 +2564,7 @@ function update(){
       for(const _ra of _rAllies){ _ra.rallyTarget=_rT3; _ra.rallyTimer=RALLY_DURATION+Math.floor(Math.random()*200); }
       // Notification centrale + journal
       if(_rTeam==='blue'){
-        _rallyNotif={type:'attack',life:300,maxLife:300,lines:[
+        _rallyNotif={type:'attack',life:300,maxLife:300,fromTeam:'blue',lines:[
           {text:'— RENFORT —',col:'#4aadff'},
           {text:_rCaller.name+' : Attaque sur',col:'#aaccff'},
           {text:'[ '+_rT3.name+' ]',col:'#ff6050'},
@@ -2363,7 +2572,7 @@ function update(){
         addLog([{text:_rCaller.name,col:'#4aadff'},{text:' → Renfort sur ',col:'#aaccff'},{text:'['+_rT3.name+']',col:'#ff6050'},{text:' !',col:'#aaccff'}]);
         _rallyMarkers.push({t3:_rT3,team:'red',life:RALLY_DURATION,maxLife:RALLY_DURATION,type:'attack'});
       } else {
-        _rallyNotif={type:'defend',life:300,maxLife:300,lines:[
+        _rallyNotif={type:'defend',life:300,maxLife:300,fromTeam:'red',lines:[
           {text:'— ALERTE —',col:'#ff4444'},
           {text:'Ennemi attaque',col:'#ffaaaa'},
           {text:'[ '+_rT3.name+' ]',col:'#4aadff'},
@@ -2397,7 +2606,7 @@ function update(){
         for(const _da of _dAllies){ _da.rallyTarget=_dT3; _da.rallyTimer=RALLY_DURATION+Math.floor(Math.random()*200); }
         if(_dTeam==='blue'){
           // Notre T3 est attaqué → bannière d'urgence bleue
-          _rallyNotif={type:'defend',life:300,maxLife:300,lines:[
+          _rallyNotif={type:'defend',life:300,maxLife:300,fromTeam:'blue',lines:[
             {text:'— DÉFENSE URGENTE —',col:'#ff9900'},
             {text:_dCaller.name+' : À la rescousse de',col:'#aaccff'},
             {text:'[ '+_dT3.name+' ]',col:'#4aadff'},
@@ -2406,7 +2615,7 @@ function update(){
           _rallyMarkers.push({t3:_dT3,team:'blue',life:RALLY_DURATION,maxLife:RALLY_DURATION,type:'defend'});
         } else {
           // T3 ennemi attaqué par les bleus → bannière offensive
-          _rallyNotif={type:'attack',life:300,maxLife:300,lines:[
+          _rallyNotif={type:'attack',life:300,maxLife:300,fromTeam:'blue',lines:[
             {text:'— OFFENSIVE ALLIÉE —',col:'#44ffaa'},
             {text:_dAttackers.length+' alliés attaquent',col:'#aaccff'},
             {text:'[ '+_dT3.name+' ]',col:'#ff6050'},
@@ -2424,7 +2633,7 @@ function update(){
     for(const sp of spawns){
       if(sp.team==='neutral') continue;
       const _healR=SPAWN_RADIUS*1.6;
-      const _healShips=[...(sp.team==='blue'?[...blues,...(ship.dead?[]:[ship])]:reds)]
+      const _healShips=[...(sp.team==='blue'?(_mpConnected?blues:[...blues,...(ship.dead?[]:[ship])]):reds)]
         .filter(a=>!a.dead&&a.team===sp.team&&Math.hypot(a.x-sp.x,a.y-sp.y)<_healR);
       for(const h of _healShips){
         if(h.hp<h.maxHp) h.hp=Math.min(h.maxHp,h.hp+1);
@@ -2453,6 +2662,7 @@ function update(){
   const _wasShipAlive=!ship.dead;
   if(_astSfxThrottle>0) _astSfxThrottle--;
 
+  if(!_mpConnected){ // Solo uniquement — en MP le joueur est géré via _mpMyShip
   if(ship.dead){
     if(_playerLives>0&&--ship.respawnTimer<=0){
       // Spawn joueur uniquement sur T3 bleus vivants
@@ -2555,19 +2765,9 @@ function update(){
       }
     }
   }
+  } // fin !_mpConnected
 
   updateAsteroids();
-  // Formation d'escorte
-  if(formationNotif>0) formationNotif--;
-  if(!ship.dead){
-    if(--formationTimer<=0){
-      formationTimer=900+Math.floor(Math.random()*600);
-      triggerFormation();
-    }
-    // Remplacement d'un membre tombé
-    if(formationFillTimer>0&&--formationFillTimer<=0) triggerFormation();
-  }
-  formationActive=blues.some(a=>a.formSlot!==undefined&&!a.dead);
   for(const ai of blues){
     if(ai._netPid!==undefined){
       if(ai.dead){ mpNetRespawn(ai,'blue'); }
@@ -2583,14 +2783,9 @@ function update(){
             _np._fresh=false;
             ai.x=_np.x; ai.y=_np.y;
             ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
-            // CLIENT est autoritaire pour son propre hp/dead (modèle relay)
-            if(_np.hp!==undefined) ai.hp=_np.hp;
-            if(_np.shield!==undefined) ai.shield=_np.shield;
-            if(_np.dead!==undefined){
-              if(_np.dead&&!ai.dead){ ai.dead=true; ai.respawnTimer=_np.respawnTimer||RESPAWN_FRAMES; addExplosion(ai.x,ai.y,ai.team); teamLives[ai.team]--; mpLog(`HOST: mort reçue de ${ai.name||'?'} (${ai.team}) timer=${ai.respawnTimer}`); }
-              else if(!_np.dead&&ai.dead){ ai.dead=false; ai.respawnTimer=0; ai.immuneTimer=SPAWN_IMMUNE; mpLog(`HOST: respawn reçu de ${ai.name||'?'} (${ai.team})`); }
-            }
-            if(_np.immuneTimer!==undefined&&!_np.dead) ai.immuneTimer=_np.immuneTimer;
+            // HOST est autoritaire pour les HP (dégâts via collision HOST)
+            // Ne pas écraser ai.hp depuis le client → bullets HOST font des dégâts réels
+
           }
           ai.x+=ai.vx; ai.y+=ai.vy;
           ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
@@ -2614,14 +2809,9 @@ function update(){
             _np._fresh=false;
             ai.x=_np.x; ai.y=_np.y;
             ai.vx=_np.vx; ai.vy=_np.vy; ai.angle=_np.angle; ai.angVel=_np.angVel||0;
-            // CLIENT est autoritaire pour son propre hp/dead (modèle relay)
-            if(_np.hp!==undefined) ai.hp=_np.hp;
-            if(_np.shield!==undefined) ai.shield=_np.shield;
-            if(_np.dead!==undefined){
-              if(_np.dead&&!ai.dead){ ai.dead=true; ai.respawnTimer=_np.respawnTimer||RESPAWN_FRAMES; addExplosion(ai.x,ai.y,ai.team); teamLives[ai.team]--; mpLog(`HOST: mort reçue de ${ai.name||'?'} (${ai.team}) timer=${ai.respawnTimer}`); }
-              else if(!_np.dead&&ai.dead){ ai.dead=false; ai.respawnTimer=0; ai.immuneTimer=SPAWN_IMMUNE; mpLog(`HOST: respawn reçu de ${ai.name||'?'} (${ai.team})`); }
-            }
-            if(_np.immuneTimer!==undefined&&!_np.dead) ai.immuneTimer=_np.immuneTimer;
+            // HOST est autoritaire pour les HP (dégâts via collision HOST)
+            // Ne pas écraser ai.hp depuis le client → bullets HOST font des dégâts réels
+
           }
           ai.x+=ai.vx; ai.y+=ai.vy;
           ai.angle+=ai.angVel; ai.angVel*=DAMPING_ANG;
@@ -2629,12 +2819,13 @@ function update(){
           updateNetPlayer(ai,null,true,true); // _noBullets=true : pas d'auto-tir côté host pour joueur distant
         }
       }
-    } else updateAI(ai,[...blues,ship]);
+    } else updateAI(ai,_mpConnected?blues:[...blues,ship]);
     applyGravity(ai,false); wallBounce(ai);
   }
   updateCaptures();
   updateSpawnTurrets();
   updateWorldSystems();
+  processPendingHits(); // Hitscan : appliquer les dégâts différés
 
   for(let i=bullets.length-1;i>=0;i--){
     const b=bullets[i];
@@ -2646,7 +2837,7 @@ function update(){
       // Aimantation : trouver la cible la plus proche si la cible courante est morte
       let _htgt=b.target&&!b.target.dead?b.target:null;
       if(!_htgt){
-        const _pool=b.team==='blue'?reds:[...blues,ship];
+        const _pool=b.team==='blue'?reds:(_mpConnected?blues:[...blues,ship]);
         let _hd=Infinity;
         for(const _he of _pool){
           if(_he.dead) continue;
@@ -2674,11 +2865,11 @@ function update(){
 
     const tgts=b.team==='blue'?reds:blues;
     let hit=false;
+    if(b.cosmetic){/* missile cosmétique — pas de collision */}
+    else
     for(const e of tgts){
       if(e.dead) continue;
-      // Modèle relay : chaque joueur est autoritaire pour ses propres dégâts
-      // HOST : skip les vaisseaux joueurs distants (ils gèrent eux-mêmes)
-      if(_mpConnected&&_mpIsHost&&e._netPid!==undefined&&!(e._netTeam===_mpMyTeam&&e._netSlot===_mpMySlot)) continue;
+      // HOST est autoritaire pour tous les dégâts (y compris les joueurs distants)
       // CLIENT : ne vérifier que son propre vaisseau (les autres se gèrent eux-mêmes)
       if(_mpConnected&&!_mpIsHost&&e!==_mpMyShip) continue;
       const _eHR=(e.radius||SHIP_RADIUS)*(b.owner==='player'?1.4:1.1); if(Math.hypot(b.x-e.x,b.y-e.y)<_eHR){
@@ -2694,31 +2885,29 @@ function update(){
             else if(b.shooter&&!b.shooter.isMercenary){ b.shooter.kills++; b.shooter.dmgDealt+=e.maxHp; }
             const sn=b.shooter?.name||'?';
             addLog([{text:sn,col:teamCol(b.team)},{text:' ✕ ',col:'#888'},{text:e.name,col:teamCol(e.team)}]);
-            if(e.formSlot!==undefined){
-              playerFeedback.push({type:'formDeath',label:`${e.name} est tombé`,life:180,maxLife:180});
-              formationFillTimer=300;
-            }
           } else if(wasPlayer){
             _score+=8; _dmgDealt+=1;
             playerFeedback.push({type:'hit',life:40,maxLife:40});
+            playerFeedback.push({type:'hitmarker',life:10,maxLife:10});
           }
         } else if(wasPlayer){
           playerFeedback.push({type:'hit',life:50,maxLife:50});
+          playerFeedback.push({type:'hitmarker',life:10,maxLife:10});
         }
         hit=true; break;
       }
     }
     if(hit){bullets.splice(i,1);continue;}
 
-    // Bullets rouges vs joueur
-    if(b.team==='red'&&!ship.dead&&Math.hypot(b.x-ship.x,b.y-ship.y)<(ship.radius||SHIP_RADIUS)*0.9){
+    // Bullets rouges vs joueur (solo uniquement — en MP le joueur est dans blues[]/reds[])
+    if(!_mpConnected&&b.team==='red'&&!ship.dead&&Math.hypot(b.x-ship.x,b.y-ship.y)<(ship.radius||SHIP_RADIUS)*0.9){
       addSpark(b.x,b.y,'red');
       if(b.zeroDmg){ bullets.splice(i,1); continue; } // balle 0 dégâts du bot test
       if(!takeHit(ship)){
         ship.hp--; ship.hit=10;
         if(ship.hp<=0){ship.dead=true;ship.respawnTimer=RESPAWN_FRAMES;addExplosion(ship.x,ship.y,'blue');teamLives.blue--;_playerLives--;dropPickup(ship.x,ship.y);playSound('explode',0.7);
           if(_playerLives<=0&&!_playerGameOver){_playerGameOver=true;if(_score>_highScore){_highScore=_score;localStorage.setItem(_hiKey,_highScore);}}
-          addLog([{text:b.shooter?.name||'?',col:teamCol('red')},{text:' ✕ ',col:'#888'},{text:'JOUEUR',col:teamCol('blue')}]);}
+          addLog([{text:b.shooter?.name||'?',col:teamCol('red')},{text:' ✕ ',col:'#888'},{text:ship.name,col:teamCol(ship.team)}]);}
       }
       bullets.splice(i,1); continue;
     }
@@ -2812,7 +3001,7 @@ function update(){
       _lz.dmgTimer=0;
       if(_ltgt){
         const _lrange=FIRE_RANGE*1.35;
-        const _lfoes=_lz.team==='blue'?reds:[...blues,ship];
+        const _lfoes=_lz.team==='blue'?reds:(_mpConnected||ship.dead?blues:[...blues,ship]);
         for(const _lc of _lcpos){
           const _lang=Math.atan2(_ltgt.y-_lc.y,_ltgt.x-_lc.x);
           // Vérifier arc avant bloqué
@@ -2836,13 +3025,13 @@ function update(){
                   dropPickup(_le.x,_le.y);playSound('explode',0.55,_le.x,_le.y);
                   if(_lwp){calcKillScore(_le);_dmgDealt+=_le.maxHp;}
                   else if(_lsh&&!_lsh.isMercenary&&!_lsh._station){_lsh.kills++;_lsh.dmgDealt+=_le.maxHp;}
-                  addLog([{text:_lsh.name||'?',col:teamCol(_lz.team)},{text:' ✕ ',col:'#888'},{text:_le.name||'JOUEUR',col:teamCol(_le.team)}]);
-                } else if(_lwp){_score+=8;_dmgDealt+=1;playerFeedback.push({type:'hit',life:40,maxLife:40});}
+                  addLog([{text:_lsh.name||'?',col:teamCol(_lz.team)},{text:' ✕ ',col:'#888'},{text:_le.name||'?',col:teamCol(_le.team)}]);
+                } else if(_lwp){_score+=8;_dmgDealt+=1;playerFeedback.push({type:'hit',life:40,maxLife:40});playerFeedback.push({type:'hitmarker',life:10,maxLife:10});}
               } else if(_lwp){playerFeedback.push({type:'hit',life:50,maxLife:50});}
             }
           }
-          // Laser vs joueur (si laser rouge)
-          if(_lz.team==='red'&&!ship.dead){
+          // Laser vs joueur (solo uniquement — en MP le joueur est dans blues[]/reds[])
+          if(!_mpConnected&&_lz.team==='red'&&!ship.dead){
             const _spex=ship.x-_lc.x,_spey=ship.y-_lc.y;
             const _sproj=Math.max(0,Math.min(_lrange,_spex*_ldx+_spey*_ldy));
             const _spcx=_lc.x+_ldx*_sproj,_spcy=_lc.y+_ldy*_sproj;
@@ -2855,7 +3044,7 @@ function update(){
                   addExplosion(ship.x,ship.y,'blue');teamLives.blue--;_playerLives--;
                   dropPickup(ship.x,ship.y);playSound('explode',0.7);
                   if(_playerLives<=0&&!_playerGameOver){_playerGameOver=true;if(_score>_highScore){_highScore=_score;localStorage.setItem(_hiKey,_highScore);}}
-                  addLog([{text:_lsh.name||'?',col:teamCol('red')},{text:' ✕ ',col:'#888'},{text:'JOUEUR',col:teamCol('blue')}]);
+                  addLog([{text:_lsh.name||'?',col:teamCol('red')},{text:' ✕ ',col:'#888'},{text:ship.name,col:teamCol(ship.team)}]);
                 }
               }
             }
@@ -2901,12 +3090,18 @@ function update(){
 
   const sB=spawns.filter(s=>s.team==='blue').length;
   const sR=spawns.filter(s=>s.team==='red').length;
-  // Partie terminée seulement quand tous les survivants sont morts
-  if(!_mpConnected){
+  // Partie terminée : solo = tous morts, MP = tickets épuisés + aucun survivant
+  if(!gameOver){
     const redAliveAny=reds.some(a=>!a.dead&&!a.isMercenary);
-    const blueAliveAny=blues.some(a=>!a.dead&&!a.isMercenary)||!ship.dead;
-    if(!redAliveAny) gameOver='blue';
-    if(!blueAliveAny) gameOver='red';
+    const blueAliveAny=blues.some(a=>!a.dead&&!a.isMercenary)||(!_mpConnected&&!ship.dead);
+    if(_mpConnected&&_mpIsHost){
+      // MP : seulement si les tickets sont aussi à zéro (pas de faux positif mid-battle)
+      if(teamLives.red<=0&&!redAliveAny) gameOver='blue';
+      if(teamLives.blue<=0&&!blueAliveAny) gameOver='red';
+    } else if(!_mpConnected){
+      if(!redAliveAny) gameOver='blue';
+      if(!blueAliveAny) gameOver='red';
+    }
   }
 }
 
@@ -2988,32 +3183,110 @@ function drawPlanet(){
   ctx.strokeStyle='rgba(80,150,240,0.35)'; ctx.lineWidth=2.5; ctx.stroke();
 }
 
+function drawMPRoster(){
+  if(!_mpConnected||_mpPlayers.size===0) return;
+  const W=canvas.width, H=canvas.height;
+  ctx.save();
+  const ROW=16, PAD=6, COL_W=110, GAP=6;
+  // Separer bleus et rouges
+  const _blues=[..._mpPlayers.values()].filter(p=>p.team==='blue');
+  const _reds=[..._mpPlayers.values()].filter(p=>p.team==='red');
+  const maxRows=Math.max(_blues.length,_reds.length);
+  if(maxRows===0){ctx.restore();return;}
+  const panelW=COL_W*2+GAP+PAD*2;
+  const panelH=PAD*2+14+maxRows*ROW+2;
+  const px=10, py=10;
+  // Fond
+  ctx.fillStyle='rgba(4,8,24,0.72)';
+  ctx.beginPath(); ctx.roundRect(px,py,panelW,panelH,6); ctx.fill();
+  ctx.strokeStyle='rgba(100,120,200,0.22)'; ctx.lineWidth=1;
+  ctx.stroke();
+  // En-tetes equipes
+  ctx.font='bold 8px monospace'; ctx.textAlign='left';
+  ctx.fillStyle='rgba(70,160,255,0.8)';
+  ctx.fillText('BLEUS',px+PAD, py+PAD+8);
+  ctx.fillStyle='rgba(255,90,60,0.8)';
+  ctx.fillText('ROUGES',px+PAD+COL_W+GAP, py+PAD+8);
+  // Separateur
+  ctx.strokeStyle='rgba(120,130,180,0.18)'; ctx.lineWidth=0.5;
+  ctx.beginPath(); ctx.moveTo(px+PAD,py+PAD+12); ctx.lineTo(px+panelW-PAD,py+PAD+12); ctx.stroke();
+  // Dessiner chaque colonne
+  const drawCol=(_list,colX)=>{
+    for(let i=0;i<_list.length;i++){
+      const p=_list[i];
+      const fl=p.team==='blue'?blues:reds;
+      const ai=fl[p.slot];
+      const alive=ai&&!ai.dead;
+      const isSelf=(p.team===_mpMyTeam&&p.slot===_mpMySlot);
+      const ry=py+PAD+14+i*ROW+ROW*0.75;
+      // Point de vie color
+      const dotCol=alive?(p.team==='blue'?'#4aadff':'#ff5a3a'):'rgba(120,120,120,0.5)';
+      ctx.beginPath(); ctx.arc(colX+5,ry-4,3.5,0,Math.PI*2);
+      ctx.fillStyle=dotCol; ctx.fill();
+      // Nom
+      ctx.font=isSelf?'bold 9px monospace':'9px monospace';
+      ctx.textAlign='left';
+      ctx.fillStyle=alive?(isSelf?'#ffffff':(p.team==='blue'?'rgba(130,190,255,0.9)':'rgba(255,140,110,0.9)')):'rgba(100,100,100,0.55)';
+      ctx.shadowColor='rgba(0,0,0,0.8)'; ctx.shadowBlur=3;
+      const _nm=p.name.slice(0,10)+(p.name.length>10?'…':'');
+      ctx.fillText(_nm, colX+13, ry);
+      ctx.shadowBlur=0;
+      // Barre HP
+      if(ai){
+        const hpPct=Math.max(0,ai.hp/ai.maxHp);
+        const barW=COL_W-20, barH=2;
+        const barX=colX+13, barY=ry+2;
+        ctx.fillStyle='rgba(255,255,255,0.1)';
+        ctx.fillRect(barX,barY,barW,barH);
+        const hpCol=hpPct>0.5?'rgba(60,220,100,0.7)':hpPct>0.25?'rgba(255,180,40,0.7)':'rgba(255,60,40,0.7)';
+        ctx.fillStyle=hpCol;
+        ctx.fillRect(barX,barY,barW*hpPct,barH);
+      }
+    }
+  };
+  drawCol(_blues, px+PAD);
+  drawCol(_reds,  px+PAD+COL_W+GAP);
+  ctx.restore();
+}
+
 function drawMPNames(){
-  if(_mpPlayers.size===0) return;
+  if(!_mpConnected) return;
   const cx=canvas.width/2, cy=canvas.height/2;
   ctx.save();
   ctx.textAlign='center'; ctx.font='bold 11px monospace';
-  // Joueurs dans blues/reds
+  const _nameCol='#ffe033';
+  const _nameColSelf='#ffffff'; // joueur local en blanc pour se reperer
+  // Tous les joueurs enregistres (clients + host s'il est dans _mpPlayers)
   for(const [,p] of _mpPlayers){
     const fl=p.team==='blue'?blues:reds;
     const ai=fl[p.slot];
     if(!ai||ai.dead) continue;
     const sx=ai.x-_camX+cx, sy=ai.y-_camY+cy;
     if(sx<-60||sx>canvas.width+60||sy<-60||sy>canvas.height+60) continue;
-    const col=p.team==='blue'?'#4aadff':'#ff6050';
-    ctx.fillStyle='rgba(0,0,0,0.55)';
+    const isSelf=(p.team===_mpMyTeam&&p.slot===_mpMySlot);
+    const col=isSelf?_nameColSelf:_nameCol;
     const tw=ctx.measureText(p.name).width;
-    ctx.fillRect(sx-tw/2-4,sy-32-13,tw+8,15);
-    ctx.fillStyle=col; ctx.fillText(p.name,sx,sy-32);
+    ctx.fillStyle='rgba(0,0,0,0.6)';
+    ctx.fillRect(sx-tw/2-4,sy-36-13,tw+8,15);
+    ctx.fillStyle=col;
+    ctx.shadowColor='rgba(0,0,0,0.9)'; ctx.shadowBlur=4;
+    ctx.fillText(p.name,sx,sy-36);
+    ctx.shadowBlur=0;
   }
-  // Host ship (pour non-hosts)
+  // Ship de l'host visible par les non-hosts (si pas encore dans _mpPlayers)
   if(_mpHostShipObj&&!_mpHostShipObj.dead&&!_mpIsHost){
-    const sx=_mpHostShipObj.x-_camX+cx, sy=_mpHostShipObj.y-_camY+cy;
-    if(sx>-60&&sx<canvas.width+60&&sy>-60&&sy<canvas.height+60){
-      ctx.fillStyle='rgba(0,0,0,0.55)';
-      const tw=ctx.measureText(_mpHostShipObj.name).width;
-      ctx.fillRect(sx-tw/2-4,sy-32-13,tw+8,15);
-      ctx.fillStyle='#4aadff'; ctx.fillText(_mpHostShipObj.name,sx,sy-32);
+    const _hInPlayers=[..._mpPlayers.values()].some(p=>p.team===_mpHostShipObj.team&&blues[p.slot]===_mpHostShipObj||reds[p.slot]===_mpHostShipObj);
+    if(!_hInPlayers){
+      const sx=_mpHostShipObj.x-_camX+cx, sy=_mpHostShipObj.y-_camY+cy;
+      if(sx>-60&&sx<canvas.width+60&&sy>-60&&sy<canvas.height+60){
+        const tw=ctx.measureText(_mpHostShipObj.name).width;
+        ctx.fillStyle='rgba(0,0,0,0.6)';
+        ctx.fillRect(sx-tw/2-4,sy-36-13,tw+8,15);
+        ctx.fillStyle=_nameCol;
+        ctx.shadowColor='rgba(0,0,0,0.9)'; ctx.shadowBlur=4;
+        ctx.fillText(_mpHostShipObj.name,sx,sy-36);
+        ctx.shadowBlur=0;
+      }
     }
   }
   ctx.restore();
@@ -3448,7 +3721,6 @@ function drawStars(){
 }
 
 function drawSpawns(){
-  if(_mpConnected) return; // Stations = mode solo uniquement
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const sp of spawns){
     const sx=sp.x-_camX+cx, sy=sp.y-_camY+cy;
@@ -3573,7 +3845,7 @@ function drawBullets(){
   for(const b of bullets){
     const sx=b.x-_camX+cx, sy=b.y-_camY+cy;
     if(sx<-CULL_MG||sx>W+CULL_MG||sy<-CULL_MG||sy>H+CULL_MG) continue;
-    const t=b.life/BULLET_LIFE, isBlue=b.team==='blue';
+    const t=b.cosmetic?Math.min(1.0,b.life/12):b.life/(b._maxLife||BULLET_LIFE), isBlue=b.team==='blue';
     const ang=Math.atan2(b.vy,b.vx);
     ctx.save(); ctx.translate(sx,sy); ctx.rotate(ang);
     if(simple){
@@ -3602,7 +3874,15 @@ function drawLasers(){
   if(!lasers.length) return;
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const _lz of lasers){
-    if(!_lz.cannons) continue;
+    if(!_lz.shooter) continue;
+    // Calculer cannons si absent (CLIENT ne reçoit pas ce champ de l'HOST)
+    if(!_lz.cannons){
+      const _fw=Math.cos(_lz.shooter.angle),_fu=Math.sin(_lz.shooter.angle);
+      const _lx=-_fu,_ly=_fw;
+      const _sgn=(_lz.side==='right')?-1:1;
+      const _lc0=_lz._station?{x:_lz.shooter.x,y:_lz.shooter.y}:{x:_lz.shooter.x+_lx*_sgn*26,y:_lz.shooter.y+_ly*_sgn*26};
+      _lz.cannons=[_lc0];
+    }
     const _ltgt=_lz.target&&!_lz.target.dead?_lz.target:null;
     if(!_ltgt) continue;
     const _alpha=(_lz.life/_lz.maxLife)*0.9+0.1;
@@ -3668,6 +3948,8 @@ function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const ai of fleet){
     if(ai.dead) continue;
+    // En MP : le vaisseau du joueur est dessiné par drawPlayerShip → ne pas le redessiner ici
+    if(_mpConnected&&ai===_mpMyShip) continue;
     const sx=ai.x-_camX+cx, sy=ai.y-_camY+cy;
     if(sx<-CULL_MG||sx>canvas.width+CULL_MG||sy<-CULL_MG||sy>canvas.height+CULL_MG) continue;
     const aiR=ai.radius||SHIP_RADIUS;
@@ -3747,28 +4029,7 @@ function drawAIFleet(fleet,fillColT1,strokeColT1,barCol,rgb){
   }
 }
 
-function drawFormationLinks(){
-  if(ship.dead) return;
-  const cx=canvas.width/2, cy=canvas.height/2;
-  const members=blues.filter(a=>a.formSlot!==undefined&&!a.dead);
-  if(!members.length) return;
-  for(const ai of members){
-    const sx=ai.x-_camX+cx, sy=ai.y-_camY+cy;
-    ctx.save();
-    ctx.setLineDash([6,8]);
-    ctx.strokeStyle='rgba(80,160,255,0.28)';
-    ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(sx,sy); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.translate(sx,sy);
-    ctx.strokeStyle='rgba(120,200,255,0.55)'; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(0,-7); ctx.lineTo(7,0); ctx.lineTo(0,7); ctx.lineTo(-7,0); ctx.closePath(); ctx.stroke();
-    ctx.font='bold 9px monospace'; ctx.textAlign='center';
-    ctx.fillStyle='rgba(140,210,255,0.85)';
-    ctx.fillText(ai.name, 0, -20);
-    ctx.restore();
-  }
-}
+function drawFormationLinks(){}
 
 function drawPlayerShip(){
   if(ship.dead) return;
@@ -3779,7 +4040,7 @@ function drawPlayerShip(){
   const psx=spectMode?ship.x-_camX+cx:cx;
   const psy=spectMode?ship.y-_camY+cy:cy;
   const _pRad=(ship.radius||SHIP_RADIUS);
-  drawShield(psx,psy,_pRad+2,ship,'80,160,255');
+  drawShield(psx,psy,_pRad+2,ship,ship.team==='red'?'255,80,60':'80,160,255');
   ctx.save(); ctx.translate(psx,psy); ctx.rotate(ship.angle);
   const _pType=ship.shipType||1;
   if(_pType===3){
@@ -3802,23 +4063,25 @@ function drawPlayerShip(){
     // Intercepteur joueur
     if(keys.left&&keys.right){drawFlame(-12,false);drawFlame(12,false);}
     else{if(keys.left)drawFlame(-12,false);if(keys.right)drawFlame(12,false);}
-    ctx.fillStyle=ship.hit>0?'#c8cce8':'#0a3050';
-    ctx.strokeStyle=ship.hit>0?'#ffffff':'#50e8ff'; ctx.lineWidth=1.5;
+    const _p2isRed=ship.team==='red';
+    ctx.fillStyle=ship.hit>0?'#c8cce8':(_p2isRed?'#501010':'#0a3050');
+    ctx.strokeStyle=ship.hit>0?'#ffffff':(_p2isRed?'#ff5030':'#50e8ff'); ctx.lineWidth=1.5;
     ctx.beginPath();ctx.moveTo(-18,-12);ctx.lineTo(18,-12);ctx.lineTo(0,0);ctx.closePath();ctx.fill();ctx.stroke();
     ctx.beginPath();ctx.moveTo(-18,12);ctx.lineTo(18,12);ctx.lineTo(0,0);ctx.closePath();ctx.fill();ctx.stroke();
     ctx.beginPath();ctx.moveTo(0,-5);ctx.lineTo(5,0);ctx.lineTo(0,5);ctx.lineTo(-5,0);ctx.closePath();
-    ctx.fillStyle=(keys.left||keys.right)?'rgba(80,230,255,0.9)':'rgba(40,180,200,0.5)';
-    ctx.fill();ctx.strokeStyle='#50e8ff';ctx.lineWidth=1;ctx.stroke();
+    ctx.fillStyle=(keys.left||keys.right)?(_p2isRed?'rgba(255,80,50,0.9)':'rgba(80,230,255,0.9)'):(_p2isRed?'rgba(200,50,50,0.5)':'rgba(40,180,200,0.5)');
+    ctx.fill();ctx.strokeStyle=_p2isRed?'#ff7050':'#50e8ff';ctx.lineWidth=1;ctx.stroke();
   } else {
     // Type 1 : chasseur flèche
     if(keys.left&&keys.right) drawFlame(0,true);
     else{if(keys.left)drawFlame(-7,false);if(keys.right)drawFlame(7,false);}
     ctx.beginPath();ctx.moveTo(20,0);ctx.lineTo(-14,-10);ctx.lineTo(-7,0);ctx.lineTo(-14,10);ctx.closePath();
-    ctx.fillStyle=ship.hit>0?'#c8cce8':'#152a5c'; ctx.fill();
-    ctx.strokeStyle=ship.hit>0?'#ffffff':'#4a9ff5'; ctx.lineWidth=1.5; ctx.stroke();
+    const _p1isRed=ship.team==='red';
+    ctx.fillStyle=ship.hit>0?'#c8cce8':(_p1isRed?'#5c1515':'#152a5c'); ctx.fill();
+    ctx.strokeStyle=ship.hit>0?'#ffffff':(_p1isRed?'#f54a4a':'#4a9ff5'); ctx.lineWidth=1.5; ctx.stroke();
     ctx.beginPath(); ctx.arc(7,0,4,0,Math.PI*2);
-    ctx.fillStyle=(keys.left||keys.right)?'rgba(120,220,255,0.85)':'rgba(60,140,200,0.5)';
-    ctx.fill(); ctx.strokeStyle='#8acfff'; ctx.lineWidth=0.8; ctx.stroke();
+    ctx.fillStyle=(keys.left||keys.right)?(_p1isRed?'rgba(255,120,80,0.85)':'rgba(120,220,255,0.85)'):(_p1isRed?'rgba(200,60,60,0.5)':'rgba(60,140,200,0.5)');
+    ctx.fill(); ctx.strokeStyle=_p1isRed?'#ff8a8a':'#8acfff'; ctx.lineWidth=0.8; ctx.stroke();
   }
   ctx.restore();
   const _maxHp=ship.maxHp||PLAYER_HP;
@@ -3965,6 +4228,21 @@ function drawHUD(){
         ctx.shadowColor='#00cc66'; ctx.shadowBlur=6*t;
         ctx.fillText(fb.pts, W*0.62, H/2+8+(1-t)*-12);
       }
+    } else if(fb.type==='hitmarker'){
+      // Croix centrale type hitmarker FPS
+      const _hA=t*0.9, _hSz=7+3*(1-t), _hGap=3;
+      ctx.lineWidth=1.8;
+      ctx.strokeStyle=`rgba(255,255,255,${_hA})`;
+      ctx.shadowColor='rgba(255,60,60,0.8)'; ctx.shadowBlur=6*t;
+      for(let _hd=0;_hd<4;_hd++){
+        const _ha=_hd*Math.PI/2;
+        const _hx=Math.cos(_ha), _hy=Math.sin(_ha);
+        ctx.beginPath();
+        ctx.moveTo(W/2+_hx*_hGap, H/2+_hy*_hGap);
+        ctx.lineTo(W/2+_hx*(_hGap+_hSz), H/2+_hy*(_hGap+_hSz));
+        ctx.stroke();
+      }
+      ctx.shadowBlur=0;
     } else {
       // hit
       const col=`rgba(100,220,255,${t*0.7})`;
@@ -4016,8 +4294,7 @@ function drawHUD(){
     const dEdge=MAP_RADIUS-Math.hypot(_camX,_camY);
     if(dEdge<700){ ctx.fillStyle=`rgba(255,100,60,0.85)`; ctx.font='bold 13px monospace'; ctx.fillText('⚠ BORD',14,22); }
   }
-
-  // ── Score arcade (coin haut-droit) ──────────────────────────────────────
+  if(!_mpConnected) // ── Score arcade (coin haut-droit) ──────────────────────────────────────
   {
     const scoreStr=String(_score).padStart(6,'0');
     const hiStr=String(_highScore).padStart(6,'0');
@@ -4165,78 +4442,50 @@ function drawHUD(){
     ctx.globalAlpha=1;
     ctx.textAlign='left';
   }
+
+  // ── Ping MP ──────────────────────────────────────────────────────────────
+  if(_mpConnected&&!_mpIsHost){
+    const _ping=Math.round(_mpRTT);
+    const _pingCol=_ping<60?'#44ff88':_ping<120?'#ffdd44':_ping<200?'#ff8844':'#ff3333';
+    const _pW=isMobile?72:86, _pH=isMobile?18:22;
+    const _pX=W-_pW-8, _pY=isMobile?90:94;
+    rr(ctx,_pX,_pY,_pW,_pH,4);
+    ctx.fillStyle='rgba(4,8,28,0.82)'; ctx.fill();
+    ctx.strokeStyle=_pingCol.replace('#','rgba(').replace(/(..)(..)(..)$/,(_,r,g,b)=>`${parseInt(r,16)},${parseInt(g,16)},${parseInt(b,16)},0.4)`);
+    ctx.lineWidth=1; ctx.stroke();
+    ctx.textAlign='center'; ctx.font=`bold ${isMobile?9:11}px monospace`;
+    ctx.fillStyle='rgba(180,190,210,0.6)';
+    ctx.fillText('PING',_pX+_pW*0.3,_pY+_pH*0.52);
+    ctx.font=`bold ${isMobile?11:13}px monospace`;
+    ctx.fillStyle=_pingCol; ctx.shadowColor=_pingCol; ctx.shadowBlur=4;
+    ctx.fillText(_ping+'ms',_pX+_pW*0.72,_pY+_pH*0.78);
+    ctx.shadowBlur=0; ctx.textAlign='left';
+  }
 }
 
-function drawMpCoords(){
-  if(!_mpConnected) return;
-  const W=canvas.width, H=canvas.height;
-  ctx.save();
-  ctx.font='bold 13px monospace';
-  ctx.textAlign='left';
-  ctx.shadowColor='#000'; ctx.shadowBlur=4;
-  let row=0;
-  // Collect all player ships
-  const allShips=[];
-  for(const b of blues){
-    if(b._netPid!==undefined){
-      allShips.push({ship:b,team:'blue',name:b.name||('blue'+b._netSlot),isMe:b===_mpMyShip});
-    }
-  }
-  for(const r of reds){
-    if(r._netPid!==undefined){
-      allShips.push({ship:r,team:'red',name:r.name||('red'+r._netSlot),isMe:r===_mpMyShip});
-    }
-  }
-  // Header
-  const _dbgExtra=_mpIsHost
-    ? `  rx:${_mpDbgRx||0}`
-    : `  tx:${_mpDbgTx||0}  ship:${_mpMyShip?'OK':'NULL'}`;
-  ctx.fillStyle='rgba(0,0,0,0.55)';
-  ctx.fillRect(8, 8, 340, 22+(allShips.length+1)*20);
-  ctx.fillStyle='#fff';
-  ctx.fillText('─── MP COORDS '+((_mpIsHost)?'[HOST]':'[CLIENT]')+' ───', 14, 24);
-  row++;
-  ctx.fillStyle='#ff0';
-  ctx.fillText(_dbgExtra, 14, 24+row*20);
-  row++;
-  for(const {ship,team,name,isMe} of allShips){
-    const col=team==='blue'?'#6af':'#f76';
-    ctx.fillStyle=col;
-    const status=ship.dead?'☠':'●';
-    const label=`${status} ${name}${isMe?' ◄':''}`;
-    const coords=ship.dead?'(mort)':` x:${Math.round(ship.x)}  y:${Math.round(ship.y)}`;
-    ctx.fillText(label+coords, 14, 24+row*20);
-    row++;
-  }
-  // Journal des événements MP
-  if(_mpLog.length>0){
-    const lx=8, ly=30+(allShips.length+2)*20+8;
-    ctx.fillStyle='rgba(0,0,0,0.55)';
-    ctx.fillRect(lx, ly, 400, 16+_mpLog.length*16);
-    ctx.font='11px monospace'; ctx.fillStyle='#aaf';
-    ctx.fillText('─── MP LOG ───', lx+6, ly+13);
-    for(let i=0;i<_mpLog.length;i++){
-      const age=i/(_mpLog.length||1);
-      ctx.globalAlpha=1-age*0.65;
-      ctx.fillStyle=_mpLog[i].includes('DEATH')||_mpLog[i].includes('mort')||_mpLog[i].includes('dead')?'#f88':
-                    _mpLog[i].includes('RESPAWN')||_mpLog[i].includes('respawn')?'#8f8':'#aaa';
-      ctx.fillText(_mpLog[i].slice(0,60), lx+6, ly+14+( i+1)*16);
-    }
-    ctx.globalAlpha=1;
-  }
-  ctx.shadowBlur=0;
-  ctx.restore();
-}
 
 function drawGameOver(){
   const W=canvas.width, H=canvas.height;
   ctx.fillStyle='rgba(0,0,0,0.75)'; ctx.fillRect(0,0,W,H);
   const col=gameOver==='blue'?'#4a9ff5':'#ff5040';
-  const label=gameOver==='blue'?'VICTOIRE — BLEUS':'VICTOIRE — ROUGES';
+  const _goWinnerLabel=gameOver==='blue'?'VICTOIRE — BLEUS':'VICTOIRE — ROUGES';
+  // En MP : afficher VICTOIRE ou DÉFAITE selon l'équipe du joueur
+  const _goMyTeam=_mpConnected?_mpMyTeam:(gameOver==='blue'?'blue':'red');
+  const _goWon=_goMyTeam===gameOver;
+  const _goPersonal=_mpConnected?(_goWon?'VICTOIRE !':'DÉFAITE'):''; // solo: pas de label perso
+  const label=_goWinnerLabel;
   ctx.textAlign='center';
   ctx.fillStyle=col; ctx.font='bold 52px monospace';
   ctx.shadowColor=col; ctx.shadowBlur=24;
   ctx.fillText(label,W/2,H/2-60);
+  // Label personnel VICTOIRE/DÉFAITE en MP
+  if(_mpConnected&&_goPersonal){
+    const _pCol=_goWon?'#ffe060':'rgba(200,100,80,0.9)';
+    ctx.font='bold 28px monospace';
+    ctx.fillStyle=_pCol; ctx.shadowColor=_pCol; ctx.shadowBlur=16;
+    ctx.fillText(_goPersonal,W/2,H/2-20);
+    ctx.shadowBlur=0;
+  }
   ctx.shadowBlur=0;
   // Score joueur
   ctx.strokeStyle='rgba(200,200,255,0.2)'; ctx.lineWidth=1;
@@ -4261,11 +4510,17 @@ function drawGameOver(){
   }
   ctx.font='11px monospace'; ctx.fillStyle='rgba(150,170,210,0.6)';
   ctx.fillText(`KILLS : ${_kills}   CAPTURES : ${_caps}   DGT : ${_dmgDealt}`,W/2,H/2+68);
+  // ── Compte à rebours relance ──────────────────────────────────────────
+  const _goSec=Math.ceil(Math.max(0,1200-_goCountdown)/60);
+  ctx.font='bold 11px monospace';
+  ctx.fillStyle=_goSec<=5?'rgba(255,120,80,0.85)':'rgba(150,170,210,0.5)';
+  ctx.fillText(`Nouvelle partie dans ${_goSec}s…`,W/2,H/2+84);
   // ── Leaderboard bots (toutes équipes, multi-colonnes) ──
   if(!isMobile){
     // Entrée joueur synthétique
-    const _playerEntry={name:'JOUEUR',team:'blue',kills:_kills,caps:_caps,dmgDealt:_dmgDealt,isPlayer:true};
-    const allBots=[_playerEntry,...blues,...reds].filter(a=>a.isPlayer||((!a.isMercenary&&a.shipType!==3)));
+    const _playerEntry=_mpConnected?null:{name:ship.name,team:ship.team,kills:_kills,caps:_caps,dmgDealt:_dmgDealt,isPlayer:true};
+    const _playerEntries=_playerEntry?[_playerEntry]:[];
+    const allBots=[..._playerEntries,...blues,...reds].filter(a=>a&&(a.isPlayer||((!a.isMercenary&&a.shipType!==3))));
     allBots.sort((a,b)=>b.kills-a.kills||b.dmgDealt-a.dmgDealt);
     if(allBots.length>0){
       // Layout : 2 colonnes côte à côte, chacune avec son propre tableau
@@ -4434,22 +4689,22 @@ function drawMinimap(){
     ctx.beginPath(); ctx.arc(mpx,mpy,1.2,0,Math.PI*2); ctx.fill();
   }
   // ── Marqueurs de rally ──────────────────────────────────────────────────────
+  {const _myTeamMM=_mpConnected?_mpMyTeam:(ship.team||'blue');
   for(const _rm of _rallyMarkers){
     if(_rm.t3.dead) continue;
     const _rpx=MX+(_rm.t3.x+MAP_RADIUS)*scale, _rpy=MY+(_rm.t3.y+MAP_RADIUS)*scale;
     const _rfade=_rm.life/_rm.maxLife;
     const _rpulse=0.5+0.5*Math.sin(_gameTick*0.18);
-    const _rcol=_rm.type==='attack'?`rgba(255,80,60,${_rfade*0.9})`:`rgba(255,220,50,${_rfade*0.9})`;
-    // Anneau pulsant
+    const _isAtk=(_rm.t3.team!==_myTeamMM);
+    const _rcol=_isAtk?`rgba(255,220,50,${_rfade*0.9})`:`rgba(255,80,60,${_rfade*0.9})`;
     ctx.strokeStyle=_rcol; ctx.lineWidth=1.5;
     ctx.beginPath(); ctx.arc(_rpx,_rpy,6+_rpulse*4,0,Math.PI*2); ctx.stroke();
     ctx.beginPath(); ctx.arc(_rpx,_rpy,10+_rpulse*6,0,Math.PI*2);
-    ctx.strokeStyle=_rm.type==='attack'?`rgba(255,80,60,${_rfade*0.4})`:`rgba(255,220,50,${_rfade*0.4})`;
+    ctx.strokeStyle=_isAtk?`rgba(255,220,50,${_rfade*0.4})`:`rgba(255,80,60,${_rfade*0.4})`;
     ctx.stroke();
-    // Icone au centre
     ctx.fillStyle=_rcol; ctx.font='bold 8px monospace'; ctx.textAlign='center';
-    ctx.fillText(_rm.type==='attack'?'+':'!',_rpx,_rpy+3); ctx.textAlign='left';
-  }
+    ctx.fillText(_isAtk?'+':'!',_rpx,_rpy+3); ctx.textAlign='left';
+  }}
   // Rectangle de vue
   const vW=(canvas.width/ZOOM_WORLD)*scale, vH=(canvas.height/ZOOM_WORLD)*scale;
   const vx=MX+(_camX+MAP_RADIUS)*scale-vW/2, vy=MY+(_camY+MAP_RADIUS)*scale-vH/2;
@@ -4483,12 +4738,7 @@ function updateCamera(){
   if(_mpMyShip&&_mpConnected){
     // Client non-host : caméra sur position host-reportée (même référentiel que les balles)
     // avec lerp doux pour éviter les sauts entre les paquets
-    if(!_mpIsHost&&_mpHostReportedX!==null){
-      _camX+=(_mpHostReportedX-_camX)*0.6;
-      _camY+=(_mpHostReportedY-_camY)*0.6;
-    } else {
-      _camX=_mpMyShip.x; _camY=_mpMyShip.y;
-    }
+    _camX=_mpMyShip.x; _camY=_mpMyShip.y;
   } else {
     _camX=_spectTarget?_spectTarget.x:ship.x;
     _camY=_spectTarget?_spectTarget.y:ship.y;
@@ -4809,14 +5059,21 @@ function loop(){
           updateNetPlayer(_mpMyShip,{left:!!keys.left,right:!!keys.right},false); // tir activé côté CLIENT
           // Balles nouvelles créées par le CLIENT → relayées à l'hôte + conservées localement
           const _newBuls=bullets.slice(_bBefore);
-          _mpClientNewBullets=_newBuls.map(b=>[
-            Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2)]);
+          _mpClientNewBullets=_newBuls.map(b=>{
+            let _tt=-1,_ti=-1;
+            if(b.target&&!b.target.dead){
+              const _ta=b.target.team==='blue'?blues:reds;
+              _ti=_ta.indexOf(b.target);
+              _tt=b.target.team==='blue'?0:1;
+            }
+            return [Math.round(b.x),Math.round(b.y),+b.vx.toFixed(2),+b.vy.toFixed(2),_tt,_ti];
+          });
+          // Mémoriser les nouvelles balles locales (affichées sans latence)
+          for(const _lb of _newBuls) _mpLocalBullets.push({x:_lb.x,y:_lb.y,vx:_lb.vx,vy:_lb.vy,team:_lb.team,life:_lb.life||80,_maxLife:_lb._maxLife||_lb.life||80,zeroDmg:!!_lb.zeroDmg,cosmetic:!!_lb.cosmetic,target:_lb.target||null});
           applyGravity(_mpMyShip,false);
           wallBounce(_mpMyShip);
         } else if(_mpMyShip&&_mpMyShip.dead){
-          // Décompte + respawn local (CLIENT est autoritaire — même logique que l'hôte)
-          if((_mpMyShip.respawnTimer||0)<=1) mpLog(`CLIENT: mpNetRespawn appel timer=${_mpMyShip.respawnTimer||0}`);
-          mpNetRespawn(_mpMyShip,_mpMyTeam);
+          // Attendre le respawn décidé par l'HOST (pas d'auto-respawn côté CLIENT)
           _mpClientNewBullets=[];
         } else { _mpClientNewBullets=[]; }
         }catch(_ce){ console.error('[MP] Erreur client loop:',_ce); if(_mpConnected) mpLog(`❌ ${_ce.message||_ce}`); _mpClientNewBullets=[]; }
@@ -4825,6 +5082,17 @@ function loop(){
     } else {
       update(); // solo
     }
+  }
+  // ── Sync ship → _mpMyShip pour que radar/son/formation utilisent le bon vaisseau ──
+  if(_mpConnected&&_mpMyShip){
+    const _ms=_mpMyShip;
+    ship.dead=_ms.dead; ship.team=_ms.team;
+    ship.x=_ms.x; ship.y=_ms.y; ship.vx=_ms.vx; ship.vy=_ms.vy;
+    ship.hp=_ms.hp; ship.maxHp=_ms.maxHp||ship.maxHp;
+    ship.angle=_ms.angle; ship.angVel=_ms.angVel||0;
+    ship.immuneTimer=_ms.immuneTimer||0; ship.hit=_ms.hit||0;
+    ship.shield=_ms.shield||0; ship.shieldHit=_ms.shieldHit||0;
+    ship.shipType=_ms.shipType||1; ship.radius=_ms.radius||SHIP_RADIUS;
   }
   updateCamera();
   updateEngineSound();
@@ -4843,26 +5111,29 @@ function loop(){
   drawAIFleet(blues,'#0d2060','#4080f0','#4aadff','80,150,255');
   drawAIFleet(reds, '#601010','#e04040','#ff6050','255,80,60');
 
-  drawFormationLinks(); drawPlayerShip(); drawRadarArrows(); drawMPNames();
+  drawFormationLinks(); drawPlayerShip(); drawRadarArrows(); drawMPNames(); drawMPRoster();
   if(_rallyMarkers.length>0&&!ship.dead){
     const cx2=canvas.width/2, cy2=canvas.height/2;
+    const _myTeam=_mpConnected?_mpMyTeam:(ship.team||'blue');
     for(const _rm of _rallyMarkers){
       if(_rm.t3.dead) continue;
+      // Attaque si la cible est dans l'équipe ennemie, défense sinon
+      const _isAttack=(_rm.t3.team!==_myTeam);
       const _rfade=(_rm.life/_rm.maxLife);
       const _pulse=0.55+0.45*Math.sin(_gameTick*0.12);
       const _tx=_rm.t3.x-_camX+cx2, _ty=_rm.t3.y-_camY+cy2;
       ctx.save();
       ctx.setLineDash([10,8]);
-      ctx.strokeStyle=_rm.type==='attack'
+      ctx.strokeStyle=_isAttack
         ?`rgba(255,220,40,${_rfade*_pulse*0.85})`
         :`rgba(255,100,80,${_rfade*_pulse*0.85})`;
       ctx.lineWidth=1.5;
-      ctx.shadowColor=_rm.type==='attack'?'#ffdd00':'#ff4422';
+      ctx.shadowColor=_isAttack?'#ffdd00':'#ff4422';
       ctx.shadowBlur=6;
       ctx.beginPath(); ctx.moveTo(cx2,cy2); ctx.lineTo(_tx,_ty); ctx.stroke();
       ctx.setLineDash([]);
       const _sz=8+_pulse*5;
-      ctx.strokeStyle=_rm.type==='attack'?`rgba(255,220,40,${_rfade*0.9})`:`rgba(255,100,80,${_rfade*0.9})`;
+      ctx.strokeStyle=_isAttack?`rgba(255,220,40,${_rfade*0.9})`:`rgba(255,100,80,${_rfade*0.9})`;
       ctx.lineWidth=2;
       ctx.beginPath();
       ctx.moveTo(_tx,_ty-_sz); ctx.lineTo(_tx+_sz,_ty);
@@ -4875,7 +5146,6 @@ function loop(){
   {const nebInside=NEBULAE.find(n=>Math.hypot(_camX-n.x,_camY-n.y)<n.r);
   if(nebInside){ctx.fillStyle=`rgba(${nebInside.c[0]},${nebInside.c[1]},${nebInside.c[2]},0.13)`;ctx.fillRect(0,0,canvas.width,canvas.height);}}
   drawHUD();
-  drawMpCoords();
   if(_deathFxTimer>0){
     const t=_deathFxTimer/75;
     ctx.fillStyle=`rgba(180,0,0,${t*t*0.55})`;
@@ -4886,25 +5156,112 @@ function loop(){
     ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
   }
   if(gameOver) drawGameOver();
+  _tickGameOverCountdown();
+  _tickMPReconnect();
+  if(_mpDisconnected) _drawDisconnectOverlay();
   requestAnimationFrame(loop);
 }
 loop();
-function resizeCanvas(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;}
-window.addEventListener('resize', resizeCanvas);
-window.addEventListener('orientationchange', ()=>{ setTimeout(resizeCanvas,120); });
-canvas.addEventListener('click', e=>{
-  if(!_gameStarted) return;
-  const W=canvas.width, mx=W-38, my=56;
-  if(Math.abs(e.clientX-mx)<18&&Math.abs(e.clientY-my)<16) toggleMusic();
-});
-if(isMobile){
-  canvas.addEventListener('touchstart', e=>{
-    if((gameOver||_playerGameOver)&&_gameStarted){ location.reload(); return; }
-    if(!_gameStarted) return;
-    const t=e.touches[0], W=canvas.width, mx=W-38, my=56;
-    if(Math.abs(t.clientX-mx)<24&&Math.abs(t.clientY-my)<20) toggleMusic();
-  }, {passive:true});
+
+// Compte a rebours fin de partie - relance automatique
+function _tickGameOverCountdown(){
+  if(!gameOver||!_gameStarted) return;
+  _goCountdown++;
+  if(_goCountdown>=1200){ // 20 secondes
+    if(_mpConnected&&_mpIsHost&&_mpWs&&_mpWs.readyState===1){
+      _mpWs.send(JSON.stringify({type:'restart'}));
+    }
+    setTimeout(()=>location.reload(),200);
+  }
 }
+
+// Reconnexion automatique apres perte de connexion
+function _tickMPReconnect(){
+  if(!_mpDisconnected||!_mpSavedParams) return;
+  if(_mpReconnectAttempts>=3){
+    _mpDisconnected=false;
+    mpStatus('Reconnexion impossible');
+    setTimeout(()=>location.reload(),1500);
+    return;
+  }
+  _mpReconnectTimer--;
+  if(_mpReconnectTimer<=0){
+    _mpReconnectAttempts++;
+    _mpReconnectTimer=_mpReconnectAttempts*180;
+    mpStatus('Reconnexion tentative '+_mpReconnectAttempts+'/3...');
+    try{
+      const _rWs=new WebSocket(_mpSavedParams.url);
+      _mpWs=_rWs;
+      _rWs.onopen=()=>{
+        _mpConnected=true; _mpDisconnected=false; _mpReconnectAttempts=0;
+        _mpSavedParams.reconnected=true;
+        mpStatus('Connecté — reconnexion équipe '+_mpSavedParams.team+'...');
+        _rWs.send(JSON.stringify({type:'join',team:_mpSavedParams.team,name:_mpSavedParams.name}));
+      };
+      _rWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} mpHandleMsg(m); };
+      _rWs.onclose=()=>{
+        _mpConnected=false;
+        if(_gameStarted&&_mpSavedParams&&!_mpDisconnected){
+          _mpDisconnected=true; _mpReconnectTimer=180;
+        }
+      };
+      _rWs.onerror=()=>{ mpStatus('Erreur reconnexion'); };
+    }catch(e){ mpStatus('Erreur reconnexion'); }
+  }
+}
+
+function _drawDisconnectOverlay(){
+  if(!_mpDisconnected) return;
+  const W=canvas.width, H=canvas.height;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.72)';
+  ctx.fillRect(0,0,W,H);
+  const cx=W/2, cy=H/2;
+  ctx.strokeStyle='rgba(255,80,80,0.85)';
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  ctx.roundRect(cx-220,cy-90,440,180,12);
+  ctx.stroke();
+  ctx.fillStyle='rgba(20,0,0,0.7)';
+  ctx.fill();
+  ctx.font='bold 26px monospace';
+  ctx.textAlign='center';
+  ctx.shadowColor='#ff2222'; ctx.shadowBlur=18;
+  ctx.fillStyle='rgba(255,100,80,0.95)';
+  ctx.fillText('⚠ CONNEXION PERDUE', cx, cy-36);
+  ctx.shadowBlur=0;
+  ctx.font='15px monospace';
+  ctx.fillStyle='rgba(200,180,180,0.9)';
+  const _sec=Math.max(0,Math.ceil(_mpReconnectTimer/60));
+  if(_mpReconnectAttempts>=3){
+    ctx.fillText('Reconnexion impossible.', cx, cy+2);
+    ctx.fillText('Rechargement...', cx, cy+24);
+  } else {
+    ctx.fillText('Tentative '+(_mpReconnectAttempts+1)+'/3 dans '+_sec+'s...', cx, cy+2);
+    ctx.font='13px monospace';
+    ctx.fillStyle='rgba(160,140,140,0.7)';
+    ctx.fillText('La partie est en pause.', cx, cy+26);
+  }
+  ctx.restore();
+}
+
+// Migration d'host : resign quand onglet cache
+document.addEventListener('visibilitychange',()=>{
+  if(!_mpIsHost||!_mpConnected||!_mpWs||_mpWs.readyState!==1) return;
+  if(document.hidden){
+    _mpWs.send(JSON.stringify({type:'resign_host'}));
+    mpLog("Onglet cache - transfert hote en cours...");
+  }
+});
+
+function resizeCanvas(){canvas.width=window.innerWidth;canvas.height=window.innerHeight;}
+// Bloquer zoom navigateur ctrl+molette
+window.addEventListener('wheel',e=>{if(e.ctrlKey)e.preventDefault();},{passive:false});
+window.addEventListener('keydown',e=>{if(e.ctrlKey&&(e.key==='+'||e.key==='-'||e.key==='='||e.key==='0'))e.preventDefault();},{passive:false});
+window.addEventListener('resize', resizeCanvas);
+window.addEventListener('orientationchange', ()=>{
+  setTimeout(resizeCanvas, 200);
+});
 </script>
 </body>
 </html>
