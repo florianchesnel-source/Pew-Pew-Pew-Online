@@ -167,6 +167,13 @@ canvas.height = window.innerHeight;
 
 // ── Audio (Web Audio API) ─────────────────────────────────────────────────
 const _ac=(()=>{try{return new(window.AudioContext||window.webkitAudioContext)();}catch(e){return null;}})();
+// Buffer de bruit partagé pour les explosions (évite de recréer un ArrayBuffer à chaque son)
+const _noiseBuffer=(()=>{
+  if(!_ac) return null;
+  const buf=_ac.createBuffer(1,Math.ceil(_ac.sampleRate*0.35),_ac.sampleRate);
+  const d=buf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1);
+  return buf;
+})();
 
 // ── Hitscan : balles cosmétiques + dégâts différés synchronisés ─────────
 const _pendingHits=[];
@@ -862,10 +869,8 @@ function playSound(type,vol=0.4){
     g.gain.setValueAtTime(vol*0.35,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.09);
     o.start(t); o.stop(t+0.09);
   } else if(type==='explode'){
-    // Explosion : bruit filtré
-    const buf=_ac.createBuffer(1,_ac.sampleRate*0.35,_ac.sampleRate);
-    const d=buf.getChannelData(0); for(let i=0;i<d.length;i++) d[i]=(Math.random()*2-1);
-    const src=_ac.createBufferSource(); src.buffer=buf;
+    // Explosion : bruit filtré (buffer partagé, pas de réallocation)
+    const src=_ac.createBufferSource(); src.buffer=_noiseBuffer;
     const f=_ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=280; f.Q.value=0.6;
     src.connect(f); f.connect(g);
     g.gain.setValueAtTime(vol*0.9,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
@@ -915,9 +920,8 @@ function playSound(type,vol=0.4,wx,wy){
     g.gain.setValueAtTime(vol*0.35,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.09);
     o.start(t); o.stop(t+0.09);
   } else if(type==='explode'){
-    const buf=_ac.createBuffer(1,_ac.sampleRate*0.35,_ac.sampleRate);
-    const d2=buf.getChannelData(0); for(let i=0;i<d2.length;i++) d2[i]=(Math.random()*2-1);
-    const src=_ac.createBufferSource(); src.buffer=buf;
+    // Explosion : bruit filtré (buffer partagé, pas de réallocation)
+    const src=_ac.createBufferSource(); src.buffer=_noiseBuffer;
     const f=_ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=280; f.Q.value=0.6;
     src.connect(f); f.connect(g);
     g.gain.setValueAtTime(vol*0.9,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.35);
@@ -1133,7 +1137,7 @@ canvas.addEventListener('mousedown',   e => { if(e.button===0)keys.left=true;  i
 window .addEventListener('mouseup',    e => { if(e.button===0)keys.left=false; if(e.button===2)keys.right=false; });
 // Détection mobile
 const isMobile = navigator.maxTouchPoints > 0;
-if(isMobile){ THRUST_FWD*=0.55; MAX_SPEED*=0.55; BULLET_SPEED*=0.6; }
+if(isMobile){ THRUST_FWD*=0.55; MAX_SPEED*=0.55; }
 // Contrôles tactiles
 function evalTouches(touches){ keys.left=false; keys.right=false; for(const t of touches){ if(t.clientX<window.innerWidth/2)keys.left=true; else keys.right=true; } }
 canvas.addEventListener('touchstart', e=>{
@@ -1192,7 +1196,7 @@ function _rng(){
 _prngState = _WORLD_SEED;
 
 // ── Étoiles ───────────────────────────────────────────────────────────────
-const STARS = Array.from({length:200}, ()=>({
+const STARS = Array.from({length: isMobile ? 60 : 200}, ()=>({
   x:_rng()*3200-1600, y:_rng()*3200-1600,
   r:_rng()*1.5+0.2, alpha:_rng()*0.7+0.2, p:_rng()*0.28+0.04,
 }));
@@ -1547,26 +1551,33 @@ ship.x=sp.x+(Math.random()-0.5)*200;ship.y=sp.y+(Math.random()-0.5)*200;}
 
 const bullets=[], particles=[], pickups=[], playerFeedback=[], lasers=[];
 const MAX_LASERS=32;
+const _MAX_PARTICLES = isMobile ? 80 : 300;
 function addExplosion(x,y,team){
+  if(particles.length>=_MAX_PARTICLES) return;
   const col=team==='blue'?[80,160,255]:[255,80,60];
-  for(let i=0;i<16;i++){
+  const _n=isMobile?6:16;
+  for(let i=0;i<_n;i++){
     const a=Math.random()*Math.PI*2, spd=0.8+Math.random()*3.5;
     particles.push({x,y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:35+Math.floor(Math.random()*25),maxLife:60,r:1.5+Math.random()*2.5,col});
   }
-  particles.push({ring:true,x,y,r:4,maxR:50+Math.random()*20,life:22,maxLife:22,col});
+  if(!isMobile) particles.push({ring:true,x,y,r:4,maxR:50+Math.random()*20,life:22,maxLife:22,col});
 }
 function dropPickup(x,y){
   pickups.push({x,y,life:720,rot:0});
 }
 function addPickupEffect(x,y){
-  for(let i=0;i<10;i++){
+  if(particles.length>=_MAX_PARTICLES) return;
+  const _n=isMobile?4:10;
+  for(let i=0;i<_n;i++){
     const a=Math.random()*Math.PI*2,spd=0.5+Math.random()*2.5;
     particles.push({x,y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:22+Math.floor(Math.random()*18),maxLife:40,r:1+Math.random()*2,col:[60,220,100]});
   }
 }
 function addSpark(x,y,team){
+  if(particles.length>=_MAX_PARTICLES) return;
   const col=team==='blue'?[80,160,255]:[255,80,60];
-  for(let i=0;i<5;i++){
+  const _n=isMobile?2:5;
+  for(let i=0;i<_n;i++){
     const a=Math.random()*Math.PI*2, spd=0.4+Math.random()*2.2;
     particles.push({x,y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,life:14+Math.floor(Math.random()*10),maxLife:24,r:0.8+Math.random(),col});
   }
@@ -3282,6 +3293,21 @@ function drawMPNames(){
 
 function drawNebulae(){
   const cx=canvas.width/2, cy=canvas.height/2;
+  // ── Version mobile : 1 gradient par nébuleuse, pas d'animation ──────────
+  if(isMobile){
+    for(const n of NEBULAE){
+      const sx=n.x-_camX+cx, sy=n.y-_camY+cy;
+      if(sx<-n.r*2||sx>canvas.width+n.r*2||sy<-n.r*2||sy>canvas.height+n.r*2) continue;
+      const [r,g,b]=n.c;
+      const g1=ctx.createRadialGradient(sx,sy,0,sx,sy,n.r*1.8);
+      g1.addColorStop(0,`rgba(${r},${g},${b},0.12)`);
+      g1.addColorStop(0.5,`rgba(${r},${g},${b},0.04)`);
+      g1.addColorStop(1,'rgba(0,0,0,0)');
+      ctx.beginPath(); ctx.arc(sx,sy,n.r*1.8,0,Math.PI*2); ctx.fillStyle=g1; ctx.fill();
+    }
+    return;
+  }
+  // ── Version desktop : rendu complet ─────────────────────────────────────
   const _nt=Date.now()*0.00018;
   for(const n of NEBULAE){
     const sx=n.x-_camX+cx, sy=n.y-_camY+cy;
@@ -3704,7 +3730,11 @@ function drawStars(){
     const sx=((s.x-_camX*s.p)%(W*1.6)+W*2.4)%(W*1.6)-W*0.3;
     const sy=((s.y-_camY*s.p)%(H*1.6)+H*2.4)%(H*1.6)-H*0.3;
     ctx.fillStyle=`rgba(220,230,255,${s.alpha})`;
-    ctx.beginPath(); ctx.arc(sx,sy,s.r,0,Math.PI*2); ctx.fill();
+    if(isMobile){
+      const d=s.r*2; ctx.fillRect(sx-s.r,sy-s.r,d,d);
+    } else {
+      ctx.beginPath(); ctx.arc(sx,sy,s.r,0,Math.PI*2); ctx.fill();
+    }
   });
 }
 
@@ -3821,15 +3851,24 @@ function drawParticles(){
   const cx=canvas.width/2, cy=canvas.height/2;
   for(const p of particles){
     const sx=p.x-_camX+cx, sy=p.y-_camY+cy, t=p.life/p.maxLife, [r,g,b]=p.col;
-    if(p.ring){ctx.beginPath();ctx.arc(sx,sy,p.r,0,Math.PI*2);ctx.strokeStyle=`rgba(${r},${g},${b},${t*0.7})`;ctx.lineWidth=2*t;ctx.stroke();}
-    else{ctx.beginPath();ctx.arc(sx,sy,p.r*t+0.3,0,Math.PI*2);ctx.fillStyle=`rgba(${r},${g},${b},${t})`;ctx.fill();}
+    if(p.ring){
+      ctx.beginPath();ctx.arc(sx,sy,p.r,0,Math.PI*2);
+      ctx.strokeStyle=`rgba(${r},${g},${b},${t*0.7})`;ctx.lineWidth=2*t;ctx.stroke();
+    } else if(isMobile){
+      const sz=(p.r*t+0.3)*2;
+      ctx.fillStyle=`rgba(${r},${g},${b},${t})`;
+      ctx.fillRect(sx-sz*0.5,sy-sz*0.5,sz,sz);
+    } else {
+      ctx.beginPath();ctx.arc(sx,sy,p.r*t+0.3,0,Math.PI*2);
+      ctx.fillStyle=`rgba(${r},${g},${b},${t})`;ctx.fill();
+    }
   }
 }
 
 function drawBullets(){
   const cx=canvas.width/2, cy=canvas.height/2;
   const W=canvas.width, H=canvas.height;
-  const simple=bullets.length>160; // rendu simplifié si trop de balles
+  const simple=isMobile||bullets.length>160; // rendu simplifié sur mobile ou si trop de balles
   for(const b of bullets){
     const sx=b.x-_camX+cx, sy=b.y-_camY+cy;
     if(sx<-CULL_MG||sx>W+CULL_MG||sy<-CULL_MG||sy>H+CULL_MG) continue;
