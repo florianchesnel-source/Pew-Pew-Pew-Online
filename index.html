@@ -144,11 +144,21 @@
           color:#9ac8ff;font:10px monospace;padding:4px 6px;outline:none"
           spellcheck="false" autocomplete="off">
       </div>
+      <div style="margin:0 0 7px;display:flex;gap:5px;align-items:center">
+        <span style="font:9px monospace;color:#5a8fc8;white-space:nowrap">ROOM</span>
+        <select id="mp-room" style="flex:1;background:rgba(5,15,50,0.8);border:1px solid #2a4a8a;border-radius:4px;color:#9ac8ff;font:10px monospace;padding:4px 6px;outline:none">
+          <option value="auto">Auto (PC ↔ PC / Mobile ↔ Mobile)</option>
+          <option value="mixed">Mixte (PC + Mobile ensemble)</option>
+        </select>
+      </div>
       <div class="mp-teams">
         <button class="mp-btn-blue" onclick="mpJoin('blue')">▶ Équipe Bleue</button>
         <button class="mp-btn-red"  onclick="mpJoin('red')">▶ Équipe Rouge</button>
       </div>
-      <div id="mp-status-txt">Entrez l'URL du serveur puis choisissez une équipe</div>
+      <div id="mp-status-txt">Choisissez une room puis une équipe</div>
+      <div id="mp-lobby" style="margin-top:6px;padding:5px 6px;background:rgba(0,10,40,0.5);border-radius:4px;border:1px solid #1a3060;min-height:18px">
+        <span style="color:#3a5a8a;font:8px monospace">Connectez-vous pour voir les joueurs en ligne</span>
+      </div>
     </div>
     <div class="smenu-controls">
       Clic gauche ← rotation &nbsp;|&nbsp; clic droit → rotation<br>
@@ -258,20 +268,39 @@ let _mpAstSnapTimer=0;   // resync forcée des astéroïdes toutes les ~5s      
 let _mpHostShipData=null;       // données du ship du host (pour les non-hosts)
 let _mpHostShipObj=null;        // objet synthétique pour le rendu
 
+let _mpLobbyWs=null;
 function mpTogglePanel(){
   const p=document.getElementById('mp-panel');
-  if(p) p.style.display=p.style.display==='flex'?'none':'flex';
+  if(!p) return;
+  const opening=p.style.display!=='flex';
+  p.style.display=opening?'flex':'none';
+  // Ouvrir une connexion légère pour voir les joueurs en ligne
+  if(opening&&!_mpConnected&&(!_mpLobbyWs||_mpLobbyWs.readyState>1)){
+    try{
+      const urlEl=document.getElementById('mp-url');
+      const url=(urlEl?urlEl.value.trim():'')||'wss://pew-pew-pew-online-production.up.railway.app';
+      _mpLobbyWs=new WebSocket(url);
+      _mpLobbyWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} if(m.type==='welcome'||m.type==='rooms_update') _mpUpdateLobby(m.rooms); };
+      _mpLobbyWs.onerror=()=>{ _mpLobbyWs=null; };
+    }catch(_e){ _mpLobbyWs=null; }
+  }
+  if(!opening&&_mpLobbyWs&&_mpLobbyWs.readyState<=1){ _mpLobbyWs.close(); _mpLobbyWs=null; }
 }
 function mpStatus(txt){ const el=document.getElementById('mp-status-txt'); if(el) el.textContent=txt; }
 
 function mpJoin(team){
   const nameEl=document.getElementById('menu-name');
   const urlEl=document.getElementById('mp-url');
+  const roomEl=document.getElementById('mp-room');
   const url=(urlEl?urlEl.value.trim():'')||'wss://pew-pew-pew-online-production.up.railway.app';
   const name=(nameEl?nameEl.value.trim():'JOUEUR')||'JOUEUR';
-  mpStatus('Connexion à '+url+' …');
+  // Déterminer la room : auto → pc ou mobile selon la plateforme, sinon mixed
+  const _roomSel=roomEl?roomEl.value:'auto';
+  const platform=_roomSel==='mixed'?'mixed':(isMobile?'mobile':'pc');
+  const _roomLabel=platform==='mixed'?'Mixte':platform==='mobile'?'Mobile':'PC';
+  mpStatus('Connexion … (room '+_roomLabel+')');
   try { _mpWs=new WebSocket(url); } catch(e){ mpStatus('URL invalide'); return; }
-  _mpWs.onopen=()=>{ _mpConnected=true; _mpSavedParams={url,team,name}; _mpDisconnected=false; _mpReconnectAttempts=0; mpStatus('Connecté — rejoindre équipe '+team+'…'); _mpWs.send(JSON.stringify({type:'join',team,name})); };
+  _mpWs.onopen=()=>{ _mpConnected=true; _mpSavedParams={url,team,name,platform}; _mpDisconnected=false; _mpReconnectAttempts=0; mpStatus('Connecté — room '+_roomLabel+' — équipe '+team+'…'); _mpWs.send(JSON.stringify({type:'join',team,name,platform})); };
   _mpWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} mpHandleMsg(m); };
   _mpWs.onclose=()=>{
     _mpConnected=false;
@@ -284,8 +313,28 @@ function mpJoin(team){
   _mpWs.onerror=()=>{ mpStatus('Erreur de connexion — verifiez l URL'); };
 }
 
+function _mpUpdateLobby(roomsData){
+  const el=document.getElementById('mp-lobby');
+  if(!el||!roomsData) return;
+  const labels={pc:'💻 PC',mobile:'📱 Mobile',mixed:'🌐 Mixte'};
+  let html='';
+  for(const [key,players] of Object.entries(roomsData)){
+    if(!players.length) continue;
+    html+=`<div style="margin:3px 0"><span style="color:#5a8fc8;font:8px monospace">${labels[key]||key} :</span> `;
+    html+=players.map(p=>`<span style="color:${p.team==='blue'?'#4aadff':'#ff6050'};font:bold 9px monospace">${p.name}</span>`).join(' · ');
+    html+='</div>';
+  }
+  el.innerHTML=html||'<span style="color:#3a5a8a;font:8px monospace">Aucun joueur connecté</span>';
+}
+
 function mpHandleMsg(msg){
   switch(msg.type){
+    case 'welcome':
+      _mpUpdateLobby(msg.rooms);
+      break;
+    case 'rooms_update':
+      _mpUpdateLobby(msg.rooms);
+      break;
     case 'assigned':{
       _mpMyPid=msg.pid; _mpMySlot=msg.slot; _mpMyTeam=msg.team; _mpIsHost=msg.isHost;
       mpLog(`✅ Assigné pid=${msg.pid} équipe=${msg.team} slot=${msg.slot} host=${msg.isHost}`);
@@ -5072,8 +5121,16 @@ let _gameStarted=false;
   if(inp) inp.addEventListener('keydown', e=>{ if(e.key==='Enter') startGame(); inp.value=inp.value.toUpperCase(); });
 }
 
-function loop(){
+const _TICK_MS = 1000/60; // timestep fixe : 60 ticks/s indépendant du refresh rate
+let _lastTickTime = 0;
+
+function loop(timestamp){
   if(_gameStarted){
+    // ── Timestep fixe 60fps pour la simulation ────────────────────────────
+    const _dt = timestamp - _lastTickTime;
+    const _doTick = _dt >= _TICK_MS;
+    if(_doTick) _lastTickTime = timestamp - (_dt % _TICK_MS);
+
     if(_mpConnected){
       // Host : injecter touches locales dans la map → updateNetPlayer les applique
       if(_mpIsHost&&_mpMyShip&&_mpMySlot!==null){
@@ -5081,13 +5138,14 @@ function loop(){
           {left:!!keys.left,right:!!keys.right,fire:!!keys.fire});
       }
       if(_mpIsHost){
-        update(); // host tourne la simulation complète
-        mpSendState();
+        if(_doTick){ update(); mpSendState(); } // simulation plafonnée à 60fps
       } else {
-        // Non-host : appliquer l'état reçu du host
-        _gameTick++;  // avancer le compteur même sans update() pour les animations
+        // Non-host : appliquer l'état reçu du host (chaque frame pour réactivité)
         if(_mpPending){ mpApplyState(_mpPending); _mpPending=null; }
-        // Nettoyage minimal non-hôte : bullets + particles + bannières expirent correctement
+        if(_doTick){
+        // Avancer la simulation locale seulement à 60fps
+        _gameTick++;
+        // Nettoyage minimal : bullets + particles + bannières
         for(let _bi=bullets.length-1;_bi>=0;_bi--){ bullets[_bi].x+=bullets[_bi].vx; bullets[_bi].y+=bullets[_bi].vy; if(--bullets[_bi].life<=0) bullets.splice(_bi,1); }
         for(let _pi=particles.length-1;_pi>=0;_pi--){ if(--particles[_pi].life<=0) particles.splice(_pi,1); }
         if(_rallyNotif){_rallyNotif.life--;if(_rallyNotif.life<=0)_rallyNotif=null;}
@@ -5143,9 +5201,10 @@ function loop(){
         } else { _mpClientNewBullets=[]; }
         }catch(_ce){ console.error('[MP] Erreur client loop:',_ce); if(_mpConnected) mpLog(`❌ ${_ce.message||_ce}`); _mpClientNewBullets=[]; }
         mpSendInput();
+        } // fin if(_doTick) bloc client
       }
     } else {
-      update(); // solo
+      if(_doTick) update(); // solo : simulation plafonnée à 60fps
     }
   }
   // ── Sync ship → _mpMyShip pour que radar/son/formation utilisent le bon vaisseau ──
@@ -5261,7 +5320,7 @@ function _tickMPReconnect(){
         _mpConnected=true; _mpDisconnected=false; _mpReconnectAttempts=0;
         _mpSavedParams.reconnected=true;
         mpStatus('Connecté — reconnexion équipe '+_mpSavedParams.team+'...');
-        _rWs.send(JSON.stringify({type:'join',team:_mpSavedParams.team,name:_mpSavedParams.name}));
+        _rWs.send(JSON.stringify({type:'join',team:_mpSavedParams.team,name:_mpSavedParams.name,platform:_mpSavedParams.platform||( isMobile?'mobile':'pc')}));
       };
       _rWs.onmessage=e=>{ let m; try{m=JSON.parse(e.data);}catch{return;} mpHandleMsg(m); };
       _rWs.onclose=()=>{
