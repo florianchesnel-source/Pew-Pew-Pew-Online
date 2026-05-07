@@ -32,11 +32,29 @@ const rooms = {
 const wsData = new Map();
 let _nextPid = 1;
 
+// ── Snapshot des rooms pour affichage lobby ───────────────────────────────
+function _roomsSnapshot() {
+  const snap = {};
+  for (const [key, room] of Object.entries(rooms)) {
+    snap[key] = [];
+    for (const [, p] of room.clients)
+      if (p.name) snap[key].push({ name: p.name, team: p.team });
+  }
+  return snap;
+}
+
+// Envoyer rooms_update à tous les clients pas encore dans une room (lobby)
+function _broadcastLobby() {
+  const snap = _roomsSnapshot();
+  for (const [ws, pd] of wsData)
+    if (!pd.room && ws.readyState === 1) _send(ws, { type: 'rooms_update', rooms: snap });
+}
+
 // ── Connexion ─────────────────────────────────────────────────────────────
 wss.on('connection', ws => {
   const pid = _nextPid++;
   wsData.set(ws, { pid, room: null, team: null, slot: null, name: null, isHost: false, rtt: undefined });
-  _send(ws, { type: 'welcome', pid });
+  _send(ws, { type: 'welcome', pid, rooms: _roomsSnapshot() });
 
   ws.on('message', raw => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
@@ -79,6 +97,7 @@ wss.on('connection', ws => {
         // Notifier les autres joueurs de la même room
         _broadcast(room, ws, { type: 'player_joined', pid: pd.pid, team: pd.team, slot: pd.slot, name: pd.name });
         console.log(`[+][${room.name}] ${pd.name} → ${pd.team}[${pd.slot}]${pd.isHost ? ' (host)' : ''}`);
+        _broadcastLobby();
         break;
       }
 
@@ -128,6 +147,7 @@ wss.on('connection', ws => {
           _promoteHost(room, ws);
         }
         room.clients.delete(ws);
+        _broadcastLobby();
       }
     }
     wsData.delete(ws);
